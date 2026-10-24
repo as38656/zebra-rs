@@ -88,6 +88,16 @@ impl Default for UpdatePacket {
     }
 }
 
+/// Copy a finished message out of the scratch buffer it was built in.
+///
+/// Encoders reserve a whole maximum-size packet up front so the build never
+/// reallocates. An UPDATE then waits in the peer's send queue, and a buffer
+/// that keeps the scratch capacity would pin up to 64 KiB for a few dozen
+/// octets of message.
+fn into_exact(scratch: BytesMut) -> BytesMut {
+    BytesMut::from(&scratch[..])
+}
+
 impl UpdatePacket {
     pub fn pop_ipv4(&mut self) -> Option<BytesMut> {
         if self.ipv4_update.is_empty() {
@@ -134,7 +144,7 @@ impl UpdatePacket {
                 let length: u16 = buf.len() as u16;
                 buf[LENGTH_POS].copy_from_slice(&length.to_be_bytes());
 
-                return Some(buf);
+                return Some(into_exact(buf));
             }
 
             if ip.id != 0 {
@@ -149,7 +159,7 @@ impl UpdatePacket {
         let length: u16 = buf.len() as u16;
         buf[LENGTH_POS].copy_from_slice(&length.to_be_bytes());
 
-        Some(buf)
+        Some(into_exact(buf))
     }
 
     /// Emit a BGP UPDATE carrying `MP_REACH_NLRI` for AFI=1 / SAFI=1
@@ -266,7 +276,7 @@ impl UpdatePacket {
         let length: u16 = buf.len() as u16;
         buf[LENGTH_POS].copy_from_slice(&length.to_be_bytes());
 
-        Some(buf)
+        Some(into_exact(buf))
     }
 
     /// Emit one BGP UPDATE carrying an `MP_REACH_NLRI` for EVPN
@@ -313,7 +323,7 @@ impl UpdatePacket {
         let length: u16 = buf.len() as u16;
         let _ = buf.put_u16_at(16, length);
 
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     /// Serialize an SR Policy (SAFI 73, RFC 9830) MP_REACH UPDATE for
@@ -354,7 +364,7 @@ impl UpdatePacket {
         if let Some(MpReachAttr::SrPolicy { updates, .. }) = self.mp_update.as_mut() {
             updates.clear();
         }
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     /// Serialize an SR Policy MP_UNREACH (withdraw) UPDATE. Drains
@@ -385,7 +395,7 @@ impl UpdatePacket {
         if let Some(MpUnreachAttr::SrPolicy { withdraws, .. }) = self.mp_withdraw.as_mut() {
             withdraws.clear();
         }
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     /// Serialize a BGP-LS (RFC 9552, AFI 16388 / SAFI 71) MP_REACH
@@ -433,7 +443,7 @@ impl UpdatePacket {
         if oversize {
             return None;
         }
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     /// Serialize a BGP-LS MP_UNREACH (withdraw) UPDATE. Drains
@@ -477,7 +487,7 @@ impl UpdatePacket {
         if oversize {
             return None;
         }
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     pub fn pop_vpnv6(&mut self) -> Option<BytesMut> {
@@ -517,7 +527,7 @@ impl UpdatePacket {
         let length: u16 = buf.len() as u16;
         let _ = buf.put_u16_at(16, length);
 
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 
     pub fn pop_vpnv4(&mut self) -> Option<BytesMut> {
@@ -560,7 +570,7 @@ impl UpdatePacket {
         let length: u16 = buf.len() as u16;
         let _ = buf.put_u16_at(16, length);
 
-        Some(buf.get())
+        Some(into_exact(buf.get()))
     }
 }
 
@@ -606,7 +616,7 @@ impl UpdatePacket {
     /// beyond removing the silent corruption. Callers that batch an unbounded
     /// number of NLRI are still responsible for chunking to `max_packet_size`.
     pub fn try_emit(self) -> Result<BytesMut, UpdateEmitError> {
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(BGP_EXTENDED_PACKET_LEN);
         let header: BytesMut = self.header.into();
         buf.put(&header[..]);
 
@@ -662,7 +672,7 @@ impl UpdatePacket {
         let length = fit_len("message length", buf.len())?;
         buf[LENGTH_POS].copy_from_slice(&length.to_be_bytes());
 
-        Ok(buf)
+        Ok(into_exact(buf))
     }
 }
 
@@ -1318,7 +1328,7 @@ mod mp_reach_pagination_tests {
     }
 
     /// A reflected route's ordinary attributes: AS_PATH plus a community.
-    fn attrs(nexthop: BgpNexthop) -> BgpAttr {
+    pub(super) fn attrs(nexthop: BgpNexthop) -> BgpAttr {
         BgpAttr {
             aspath: Some(As4Path::from_str("65001 65002 65003").unwrap()),
             com: Some(Community::from_str("65001:100").unwrap()),
@@ -1327,7 +1337,7 @@ mod mp_reach_pagination_tests {
         }
     }
 
-    fn vpnv4_nlri(i: u32) -> Vpnv4Nlri {
+    pub(super) fn vpnv4_nlri(i: u32) -> Vpnv4Nlri {
         Vpnv4Nlri {
             label: Label::new(100, 0, true),
             rd: rd(),
@@ -1339,7 +1349,7 @@ mod mp_reach_pagination_tests {
     }
 
     /// One VPNv4 attribute group of `n` /24s, as `Peer::flush_vpnv4` builds it.
-    fn vpnv4_group(n: u32, max: usize) -> UpdatePacket {
+    pub(super) fn vpnv4_group(n: u32, max: usize) -> UpdatePacket {
         let nhop = Vpnv4Nexthop {
             rd: rd(),
             nhop: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
@@ -1368,7 +1378,7 @@ mod mp_reach_pagination_tests {
     }
 
     /// One VPNv6 attribute group of `n` /64s, as `Peer::flush_vpnv6` builds it.
-    fn vpnv6_group(n: u32, max: usize) -> UpdatePacket {
+    pub(super) fn vpnv6_group(n: u32, max: usize) -> UpdatePacket {
         let nhop = Vpnv6Nexthop {
             rd: rd(),
             nhop: "2001:db8::1".parse().unwrap(),
@@ -1394,7 +1404,7 @@ mod mp_reach_pagination_tests {
     }
 
     /// One EVPN attribute group of `n` routes, as `Peer::flush_evpn` builds it.
-    fn evpn_group(n: u32, max: usize) -> UpdatePacket {
+    pub(super) fn evpn_group(n: u32, max: usize) -> UpdatePacket {
         let nhop = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let mut update = UpdatePacket::with_max_packet_size(max);
         update.bgp_attr = Some(attrs(BgpNexthop::Evpn(nhop)));
@@ -1567,5 +1577,239 @@ mod mp_reach_pagination_tests {
     fn evpn_returns_none_when_first_route_does_not_fit() {
         let mut update = evpn_group(1, 40);
         assert!(update.pop_evpn().is_none());
+    }
+}
+
+/// Every encoded UPDATE must be handed over in a buffer of its own size, not
+/// in the maximum-packet scratch it was built in: these buffers wait in the
+/// per-peer send queue, so slack multiplies by the queue depth.
+#[cfg(test)]
+mod exact_size_tests {
+    use super::mp_reach_pagination_tests::{
+        attrs, evpn_group, vpnv4_group, vpnv4_nlri, vpnv6_group,
+    };
+    use super::*;
+    use crate::{
+        As4Path, BgpLsNlri, BgpNexthop, LsNodeDescSub, LsNodeDescriptor, LsNodeNlri, LsProtocolId,
+        Origin, SrPolicyNlri,
+    };
+    use ipnet::Ipv4Net;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::str::FromStr;
+
+    /// Allocator rounding is not under our control; anything beyond a few
+    /// octets means a scratch buffer leaked out.
+    const SLACK: usize = 16;
+
+    fn prefixes(n: u32) -> Vec<Ipv4Nlri> {
+        (0..n)
+            .map(|i| Ipv4Nlri {
+                id: 0,
+                prefix: Ipv4Net::new(Ipv4Addr::from(0x0A00_0000u32 + (i << 8)), 24).unwrap(),
+            })
+            .collect()
+    }
+
+    fn base_attr() -> BgpAttr {
+        BgpAttr {
+            origin: Some(Origin::Igp),
+            aspath: Some(As4Path::from_str("65001 65002").unwrap()),
+            nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 1))),
+            ..Default::default()
+        }
+    }
+
+    fn drain(
+        update: &mut UpdatePacket,
+        pop: impl Fn(&mut UpdatePacket) -> Option<BytesMut>,
+    ) -> Vec<BytesMut> {
+        std::iter::from_fn(|| pop(update)).collect()
+    }
+
+    fn ls_node() -> BgpLsNlri {
+        BgpLsNlri::Node(LsNodeNlri {
+            protocol_id: LsProtocolId::IsisL2,
+            identifier: 0,
+            local_node: LsNodeDescriptor {
+                subs: vec![LsNodeDescSub::IgpRouterId(vec![0, 0, 0, 0, 0, 1])],
+            },
+        })
+    }
+
+    fn sr_policy(i: u32) -> SrPolicyNlri {
+        SrPolicyNlri {
+            id: 0,
+            distinguisher: i,
+            color: 100,
+            endpoint: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+        }
+    }
+
+    fn ipv4_group(n: u32, max: usize) -> UpdatePacket {
+        let mut update = UpdatePacket::with_max_packet_size(max);
+        update.bgp_attr = Some(base_attr());
+        update.ipv4_update = prefixes(n);
+        update
+    }
+
+    /// Output of every encoder path, with the packet size that path ran at.
+    fn encodings() -> Vec<(&'static str, Vec<BytesMut>)> {
+        let max = BGP_EXTENDED_PACKET_LEN;
+        let ll: Ipv6Addr = "fe80::1".parse().unwrap();
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut out = vec![];
+
+        out.push((
+            "pop_ipv4",
+            drain(&mut ipv4_group(3, max), UpdatePacket::pop_ipv4),
+        ));
+        out.push((
+            "pop_ipv4 paginated",
+            drain(&mut ipv4_group(300, 200), UpdatePacket::pop_ipv4),
+        ));
+        out.push((
+            "pop_ipv4_mp_reach link-local",
+            drain(&mut ipv4_group(3, max), |u| {
+                u.pop_ipv4_mp_reach(Ipv4MpReachNextHop::LinkLocal(ll))
+            }),
+        ));
+        out.push((
+            "pop_ipv4_mp_reach dual paginated",
+            drain(&mut ipv4_group(300, 200), |u| {
+                u.pop_ipv4_mp_reach(Ipv4MpReachNextHop::Dual {
+                    global,
+                    link_local: ll,
+                })
+            }),
+        ));
+        out.push((
+            "pop_vpnv4",
+            drain(&mut vpnv4_group(3, max), UpdatePacket::pop_vpnv4),
+        ));
+        out.push((
+            "pop_vpnv4 paginated",
+            drain(&mut vpnv4_group(5000, max), UpdatePacket::pop_vpnv4),
+        ));
+        out.push((
+            "pop_vpnv6",
+            drain(&mut vpnv6_group(3, max), UpdatePacket::pop_vpnv6),
+        ));
+        out.push((
+            "pop_evpn",
+            drain(&mut evpn_group(3, max), UpdatePacket::pop_evpn),
+        ));
+
+        let nhop = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut sr = UpdatePacket::with_max_packet_size(max);
+        sr.bgp_attr = Some(base_attr());
+        sr.mp_update = Some(MpReachAttr::SrPolicy {
+            afi: Afi::Ip,
+            snpa: 0,
+            nhop,
+            updates: vec![sr_policy(1), sr_policy(2)],
+        });
+        out.push(("pop_srpolicy", drain(&mut sr, UpdatePacket::pop_srpolicy)));
+
+        let mut sr_withdraw = UpdatePacket::with_max_packet_size(max);
+        sr_withdraw.mp_withdraw = Some(MpUnreachAttr::SrPolicy {
+            afi: Afi::Ip,
+            withdraws: vec![sr_policy(1), sr_policy(2)],
+        });
+        out.push((
+            "pop_srpolicy_withdraw",
+            drain(&mut sr_withdraw, UpdatePacket::pop_srpolicy_withdraw),
+        ));
+
+        let mut ls = UpdatePacket::with_max_packet_size(max);
+        ls.bgp_attr = Some(base_attr());
+        ls.mp_update = Some(MpReachAttr::LinkState {
+            nhop,
+            updates: vec![ls_node()],
+        });
+        out.push(("pop_bgpls", drain(&mut ls, UpdatePacket::pop_bgpls)));
+
+        let mut ls_withdraw = UpdatePacket::with_max_packet_size(max);
+        ls_withdraw.mp_withdraw = Some(MpUnreachAttr::LinkState {
+            withdraws: vec![ls_node()],
+        });
+        out.push((
+            "pop_bgpls_withdraw",
+            drain(&mut ls_withdraw, UpdatePacket::pop_bgpls_withdraw),
+        ));
+
+        let emit = |update: UpdatePacket| vec![update.try_emit().expect("must encode")];
+
+        out.push(("try_emit end-of-rib", emit(UpdatePacket::new())));
+
+        let mut withdraw = UpdatePacket::with_max_packet_size(max);
+        withdraw.ipv4_withdraw = prefixes(1);
+        out.push(("try_emit ipv4 withdraw", emit(withdraw)));
+
+        out.push(("try_emit ipv4 update", emit(ipv4_group(3, max))));
+        out.push(("try_emit large ipv4 update", emit(ipv4_group(3000, max))));
+
+        let mut mp_withdraw = UpdatePacket::with_max_packet_size(max);
+        mp_withdraw.mp_withdraw = Some(MpUnreachAttr::Vpnv4(vec![vpnv4_nlri(1), vpnv4_nlri(2)]));
+        out.push(("try_emit vpnv4 withdraw", emit(mp_withdraw)));
+
+        let mut ipv6 = UpdatePacket::with_max_packet_size(max);
+        ipv6.bgp_attr = Some(attrs(BgpNexthop::Evpn(nhop)));
+        ipv6.mp_update = Some(MpReachAttr::Ipv6 {
+            snpa: 0,
+            nhop: IpAddr::V6(global),
+            updates: vec![crate::Ipv6Nlri {
+                id: 0,
+                prefix: "2001:db8:1::/48".parse().unwrap(),
+            }],
+        });
+        out.push(("try_emit ipv6 reach", emit(ipv6)));
+
+        out
+    }
+
+    #[test]
+    fn every_encoder_hands_over_a_buffer_of_its_own_size() {
+        let mut loose = vec![];
+        for (name, packets) in encodings() {
+            assert!(!packets.is_empty(), "{name}: expected at least one packet");
+            for bytes in packets {
+                if bytes.capacity() > bytes.len() + SLACK {
+                    loose.push(format!(
+                        "{name}: {} octets in {}",
+                        bytes.len(),
+                        bytes.capacity()
+                    ));
+                }
+            }
+        }
+        assert!(loose.is_empty(), "UPDATEs in oversized buffers: {loose:#?}");
+    }
+
+    #[test]
+    fn encoded_updates_still_declare_their_true_length() {
+        for (name, packets) in encodings() {
+            for bytes in packets {
+                let declared = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+                assert_eq!(declared, bytes.len(), "{name}: header Length");
+            }
+        }
+    }
+
+    #[test]
+    fn a_withdraw_only_update_is_tight_whatever_the_maximum() {
+        for max in [BGP_PACKET_LEN, BGP_EXTENDED_PACKET_LEN] {
+            let mut update = UpdatePacket::with_max_packet_size(max);
+            update.ipv4_withdraw = prefixes(1);
+            let bytes = update.try_emit().expect("must encode");
+            assert!(bytes.capacity() <= bytes.len() + SLACK, "max {max}");
+        }
+    }
+
+    #[test]
+    fn frequent_small_messages_are_tight() {
+        let keepalive: BytesMut = BgpHeader::new(BgpType::Keepalive, BGP_HEADER_LEN).into();
+        assert!(keepalive.capacity() <= keepalive.len() + SLACK);
+        let refresh: BytesMut = crate::RouteRefreshPacket::new(1, 1).into();
+        assert!(refresh.capacity() <= refresh.len() + SLACK);
     }
 }
