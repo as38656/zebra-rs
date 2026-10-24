@@ -36,6 +36,7 @@
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use bgp_packet::{Ipv4Nlri, Ipv6Nlri, Label, RouteDistinguisher};
 
@@ -243,8 +244,8 @@ pub struct DumpParamsV4 {
 /// (the peer checks) — `attr` is the pre-policy attribute for
 /// Adj-RIB-In; `decision` is the post-policy result (`None` = inbound
 /// policy denied the route, so the shard withdraws any prior Loc-RIB
-/// entry). Attributes travel by value; the shard interns them into its
-/// own [`super::BgpShard::attr_store`].
+/// entry). `attr` travels in an `Arc` so the NLRIs of one UPDATE share it;
+/// the shard interns it into its own [`super::BgpShard::attr_store`].
 #[derive(Debug)]
 pub struct ShardUpdateV4 {
     pub ident: usize,
@@ -254,7 +255,7 @@ pub struct ShardUpdateV4 {
     pub typ: BgpRibType,
     /// Learned from a route-reflector client (see `BgpRib::from_client`).
     pub from_client: bool,
-    pub attr: bgp_packet::BgpAttr,
+    pub attr: Arc<bgp_packet::BgpAttr>,
     pub label: Option<Label>,
     pub nexthop: Option<VpnNexthop>,
     pub enhe_egress: Option<(std::net::Ipv6Addr, u32)>,
@@ -279,9 +280,9 @@ pub struct ShardUpdateV4 {
 }
 
 /// Payload of [`ShardMsg::RouteBatchV4`]: the IPv4-unicast NLRIs from one
-/// UPDATE that hash to a single shard, plus the attribute they share
-/// (cloned once per shard, not per prefix). The shard expands each NLRI
-/// into the same work an [`ShardUpdateV4`] with `compute_policy` does.
+/// UPDATE that hash to a single shard, plus the attribute they share.
+/// The shard expands each NLRI into the same work an [`ShardUpdateV4`]
+/// with `compute_policy` does.
 #[derive(Debug)]
 pub struct ShardRouteBatchV4 {
     pub ident: usize,
@@ -289,7 +290,7 @@ pub struct ShardRouteBatchV4 {
     pub typ: BgpRibType,
     /// Learned from a route-reflector client (see `BgpRib::from_client`).
     pub from_client: bool,
-    pub attr: bgp_packet::BgpAttr,
+    pub attr: Arc<bgp_packet::BgpAttr>,
     pub nlris: Vec<Ipv4Nlri>,
     pub enhe_egress: Option<(std::net::Ipv6Addr, u32)>,
     pub stale: bool,
@@ -310,7 +311,7 @@ pub struct ShardUpdateV6 {
     pub typ: BgpRibType,
     /// Learned from a route-reflector client (see `BgpRib::from_client`).
     pub from_client: bool,
-    pub attr: bgp_packet::BgpAttr,
+    pub attr: Arc<bgp_packet::BgpAttr>,
     /// VPNv6 service label (`None` for plain v6 unicast).
     pub label: Option<Label>,
     pub nexthop: Option<VpnNexthop>,
@@ -352,7 +353,7 @@ pub struct ShardUpdateLu {
     pub typ: BgpRibType,
     /// Learned from a route-reflector client (see `BgpRib::from_client`).
     pub from_client: bool,
-    pub attr: bgp_packet::BgpAttr,
+    pub attr: Arc<bgp_packet::BgpAttr>,
     pub received_label: Label,
     pub stale: bool,
     /// See [`ShardUpdateV4::nexthop_reachable`].
@@ -467,7 +468,7 @@ mod tests {
             peer_router_id: Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: bgp_packet::BgpAttr::default(),
+            attr: Arc::new(bgp_packet::BgpAttr::default()),
             label: None,
             nexthop: None,
             enhe_egress: None,

@@ -281,6 +281,12 @@ impl BgpShard {
         self.attr_store.intern(attr)
     }
 
+    /// [`Self::intern`] for an attribute that is already in an `Arc`
+    /// (the received attribute a [`ShardMsg`] carries).
+    pub fn intern_arc(&mut self, attr: Arc<BgpAttr>) -> Arc<BgpAttr> {
+        self.attr_store.intern_arc(attr)
+    }
+
     /// The peer's Adj-RIB-In slice, if it has ever stored a route.
     pub fn adj_in(&self, ident: usize) -> Option<&ShardAdjIn> {
         self.adj_in.get(&ident)

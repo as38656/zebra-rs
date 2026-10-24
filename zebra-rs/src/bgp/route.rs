@@ -2113,11 +2113,9 @@ impl BgpRib {
     }
 
     /// As [`new`](Self::new) but takes the attribute as an owned `Arc`,
-    /// skipping the deep clone when the caller already owns the
-    /// attribute — the shard dispatcher receives it by value in a
-    /// `ShardMsg`, so it can move it straight into the row instead of
-    /// re-cloning (RIB sharding B.3; saves one `BgpAttr` clone per
-    /// received update on the hot path).
+    /// skipping the deep clone when the caller already holds one — the
+    /// shard dispatcher stores the `Arc` its attribute store hands back,
+    /// so every row with an equal attribute set shares it.
     #[allow(clippy::too_many_arguments)]
     pub fn new_arc(
         ident: usize,
@@ -4671,9 +4669,10 @@ pub fn route_ipv4_update_batch(
         return;
     };
     // IR3 stamped once for the whole UPDATE, main-side, before the shard
-    // split — every prefix (and the N>1 batch clone) sees the same attr.
+    // split — every prefix (and the N>1 batch) shares the same attr.
     let attr = otc_stamped.as_ref().unwrap_or(attr);
     let stale = stale || attr_has_llgr_stale(attr);
+    let shared = Arc::new(attr.clone());
 
     // N>1 (RIB sharding Phase C + RouteBatch): inbound policy runs in the
     // shard (no main-side `par_iter`), and this UPDATE's prefixes are
@@ -4702,7 +4701,7 @@ pub fn route_ipv4_update_batch(
                     peer_router_id,
                     typ,
                     from_client,
-                    attr: attr.clone(),
+                    attr: shared.clone(),
                     nlris,
                     enhe_egress: None,
                     stale,
@@ -4733,7 +4732,7 @@ pub fn route_ipv4_update_batch(
             peer_router_id,
             typ,
             from_client,
-            attr: attr.clone(),
+            attr: shared.clone(),
             label: None,
             nexthop: None,
             enhe_egress: None,
@@ -4961,7 +4960,7 @@ fn route_ipv4_update_decided(
             peer_router_id,
             typ,
             from_client,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label,
             nexthop,
             enhe_egress,
@@ -5001,7 +5000,7 @@ fn route_ipv4_update_decided(
         peer_router_id,
         typ,
         from_client,
-        attr: attr.clone(),
+        attr: Arc::new(attr.clone()),
         label,
         nexthop,
         enhe_egress,
@@ -8858,7 +8857,7 @@ pub fn route_ipv6_update(
         peer_router_id,
         typ,
         from_client,
-        attr: attr.clone(),
+        attr: Arc::new(attr.clone()),
         label,
         nexthop,
         stale,
@@ -9182,13 +9181,13 @@ pub fn route_labelv4_update(
     };
 
     // Adj-RIB-In keeps the pre-policy attribute (soft-reconfig replay).
-    let mut rib = BgpRib::new(
+    let mut rib = BgpRib::new_arc(
         peer_ident,
         peer_router_id,
         typ,
         lu.nlri.id,
         0,
-        &attr,
+        bgp.shard.intern(attr.clone()),
         Some(lu.label),
         None,
         stale,
@@ -9299,13 +9298,13 @@ pub fn route_labelv6_update(
     };
 
     // Adj-RIB-In keeps the pre-policy attribute (soft-reconfig replay).
-    let mut rib = BgpRib::new(
+    let mut rib = BgpRib::new_arc(
         peer_ident,
         peer_router_id,
         typ,
         lu.nlri.id,
         0,
-        &attr,
+        bgp.shard.intern(attr.clone()),
         Some(lu.label),
         None,
         stale,
@@ -11373,13 +11372,13 @@ pub fn route_evpn_update(
     };
 
     let stale = stale || attr_has_llgr_stale(attr);
-    let mut rib = BgpRib::new(
+    let mut rib = BgpRib::new_arc(
         peer_ident,
         peer_router_id,
         typ,
         id,
         0, // weight
-        attr,
+        bgp.attr_store.intern(attr.clone()),
         None, // label (not applicable to EVPN at this layer)
         None, // nexthop — see function doc
         stale,
@@ -11687,13 +11686,14 @@ pub fn route_mup_update(
     };
 
     let stale = stale || attr_has_llgr_stale(attr);
-    let mut rib = BgpRib::new(
+    let mut rib = BgpRib::new_arc(
         peer_ident,
         peer_router_id,
         typ,
         id,
-        0,    // weight
-        attr, // next-hop is carried inside attr for show
+        0, // weight
+        // next-hop is carried inside attr for show
+        bgp.attr_store.intern(attr.clone()),
         None, // label
         None, // nexthop (VpnNexthop) — not used by MUP at this layer
         stale,
@@ -11710,7 +11710,6 @@ pub fn route_mup_update(
         peer.adj_in.add_mup(rd, prefix.clone(), rib.clone());
     }
 
-    rib.attr = bgp.attr_store.intern(attr.clone());
     let _ = bgp.local_rib.update_mup(rd, prefix.clone(), rib);
     let selected = bgp.local_rib.select_best_path_mup(&rd, &prefix);
     // A received DSD: register its next-hop with NHT (so an underlay

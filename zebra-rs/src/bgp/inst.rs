@@ -9591,3 +9591,7 @@ mod enhe_link_local_review_tests;
 #[cfg(test)]
 #[path = "fib_pending_dump_review_tests.rs"]
 mod fib_pending_dump_review_tests;
+
+#[cfg(test)]
+#[path = "attr_intern_tests.rs"]
+mod attr_intern_tests;

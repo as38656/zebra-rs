@@ -12154,10 +12154,10 @@ mod transit_label_tests {
             peer_router_id: Ipv4Addr::new(10, 0, 0, 2),
             typ: BgpRibType::IBGP,
             from_client: false,
-            attr: BgpAttr {
+            attr: std::sync::Arc::new(BgpAttr {
                 nexthop: Some(BgpNexthop::Ipv4("10.0.0.2".parse().unwrap())),
                 ..Default::default()
-            },
+            }),
             label: Some(Label::new(24, 0, true)),
             nexthop: None,
             enhe_egress: None,
@@ -12235,7 +12235,7 @@ mod transit_label_tests {
             peer_router_id: Ipv4Addr::new(10, 0, 0, 2),
             typ: BgpRibType::IBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: std::sync::Arc::new(attr.clone()),
             label: Some(Label::new(24, 0, true)),
             nexthop: Some(crate::bgp::route::VpnNexthop::V6(nhop)),
             stale: false,
@@ -13046,10 +13046,10 @@ mod transit_label_tests {
             peer_router_id: Ipv4Addr::new(10, 0, 0, 2),
             typ: BgpRibType::IBGP,
             from_client: false,
-            attr: BgpAttr {
+            attr: std::sync::Arc::new(BgpAttr {
                 nexthop: Some(BgpNexthop::Ipv4("10.0.0.2".parse().unwrap())),
                 ..Default::default()
-            },
+            }),
             received_label: Label::new(24, 0, true),
             stale: false,
             nexthop_reachable: true,

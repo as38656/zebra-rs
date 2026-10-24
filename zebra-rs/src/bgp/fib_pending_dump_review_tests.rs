@@ -246,7 +246,7 @@ fn learn_in_pool(bgp: &Bgp) {
             peer_router_id: Ipv4Addr::new(10, 0, 0, 100),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: (*source_rib().attr).clone(),
+            attr: source_rib().attr.clone(),
             label: None,
             nexthop: None,
             enhe_egress: None,

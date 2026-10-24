@@ -316,9 +316,8 @@ impl BgpShard {
         }
     }
 
-    /// Expand a [`ShardMsg::RouteBatchV4`] into per-NLRI table ops. The
-    /// shared attribute is cloned per prefix here — on the worker thread,
-    /// in parallel across shards — instead of per prefix on the main task.
+    /// Expand a [`ShardMsg::RouteBatchV4`] into per-NLRI table ops. Every
+    /// NLRI gets the same shared attribute `Arc`.
     fn handle_route_batch_v4(&mut self, b: ShardRouteBatchV4) -> Vec<ShardOut> {
         let mut outs = Vec::with_capacity(b.nlris.len());
         for nlri in b.nlris {
@@ -346,11 +345,11 @@ impl BgpShard {
     }
 
     /// Shard half of `route_ipv4_update`: store Adj-RIB-In (pre-policy,
-    /// un-interned like `BgpRib::new`), and — if main's policy-in
-    /// permitted the route — intern the post-policy attribute, mint the
-    /// VPNv4 transit label, update the Loc-RIB, and report the
-    /// best-path delta. A denied route (`decision == None`) keeps its
-    /// Adj-RIB-In entry but withdraws any prior Loc-RIB row.
+    /// interned), and — if main's policy-in permitted the route — intern
+    /// the post-policy attribute, mint the VPNv4 transit label, update the
+    /// Loc-RIB, and report the best-path delta. A denied route
+    /// (`decision == None`) keeps its Adj-RIB-In entry but withdraws any
+    /// prior Loc-RIB row.
     fn handle_update_v4(&mut self, u: ShardUpdateV4) -> Vec<ShardOut> {
         let ShardUpdateV4 {
             ident,
@@ -370,16 +369,13 @@ impl BgpShard {
             compute_policy,
         } = u;
 
-        // The message owns the pre-policy attr; move it straight into
-        // the row's `Arc` (no deep clone) — it only feeds Adj-RIB-In
-        // here, since the Loc-RIB row gets the interned post-policy attr.
         let mut rib = BgpRib::new_arc(
             ident,
             peer_router_id,
             typ,
             nlri.id,
             0,
-            Arc::new(attr),
+            self.intern_arc(attr),
             label,
             nexthop,
             stale,
@@ -633,7 +629,7 @@ impl BgpShard {
     }
 
     /// Shard half of `route_ipv6_update`. Mirrors `handle_update_v4`:
-    /// store the pre-policy attribute in Adj-RIB-In (un-interned, for
+    /// store the pre-policy attribute in Adj-RIB-In (interned, for
     /// soft-reconfig), then — if inbound policy permitted the route —
     /// intern the post-policy attribute into the Loc-RIB, gate with
     /// main's NHT result, update, and report the best-path delta. A
@@ -655,16 +651,14 @@ impl BgpShard {
             decision,
         } = u;
 
-        // Adj-RIB-In keeps the pre-policy attribute (soft-reconfig
-        // replay); move it straight into the row's `Arc` (no deep clone)
-        // since the Loc-RIB row gets the interned post-policy attr.
+        // Adj-RIB-In keeps the pre-policy attribute (soft-reconfig replay).
         let mut rib = BgpRib::new_arc(
             ident,
             peer_router_id,
             typ,
             nlri.id,
             0,
-            Arc::new(attr),
+            self.intern_arc(attr),
             label,
             nexthop,
             stale,
@@ -779,7 +773,7 @@ impl BgpShard {
         } = u;
         // No inbound policy (like v6): Adj-RIB-In and Loc-RIB share one
         // interned attr.
-        let attr = self.intern(attr);
+        let attr = self.intern_arc(attr);
         let mut rib = BgpRib::new_arc(
             ident,
             peer_router_id,
@@ -1102,7 +1096,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label: None,
             nexthop: None,
             enhe_egress: None,
@@ -1131,7 +1125,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr,
+            attr: Arc::new(attr),
             label: None,
             nexthop: None,
             enhe_egress: None,
@@ -1162,7 +1156,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label: None,
             nexthop: None,
             stale: false,
@@ -1183,7 +1177,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr_with_nh("192.0.2.1"),
+            attr: Arc::new(attr_with_nh("192.0.2.1")),
             received_label: bgp_packet::Label::new(recv_label, 0, true),
             stale: false,
             nexthop_reachable: true,
@@ -1207,7 +1201,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label: None,
             nexthop: None,
             enhe_egress: None,
@@ -1242,7 +1236,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label: None,
             nexthop: None,
             stale: false,
@@ -1329,7 +1323,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr_with_nh("172.16.0.2"),
+            attr: Arc::new(attr_with_nh("172.16.0.2")),
             label: Some(bgp_packet::Label::new(16, 0, true)),
             nexthop: None,
             enhe_egress: None,
@@ -1368,7 +1362,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::IBGP,
             from_client: false,
-            attr: attr_with_nh("172.16.0.2"),
+            attr: Arc::new(attr_with_nh("172.16.0.2")),
             label: Some(bgp_packet::Label::new(16, 0, true)),
             nexthop: None,
             enhe_egress: None,
@@ -1446,7 +1440,7 @@ mod tests {
             peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
             typ: BgpRibType::EBGP,
             from_client: false,
-            attr: attr.clone(),
+            attr: Arc::new(attr.clone()),
             label: Some(bgp_packet::Label::new(16, 0, true)),
             nexthop: Some(super::super::super::route::VpnNexthop::V6(nhop)),
             stale: false,
@@ -1757,5 +1751,138 @@ mod tests {
             "nothing sent, the row reported: {out:?}"
         );
         assert!(rx.try_recv().is_err(), "no UPDATE left the shard");
+    }
+
+    fn adj_in_v4_attr(shard: &BgpShard, ident: usize, prefix: &str) -> Arc<BgpAttr> {
+        let prefix: Ipv4Net = prefix.parse().unwrap();
+        shard.adj_in(ident).unwrap().v4.0[&prefix][0].attr.clone()
+    }
+
+    fn loc_rib_v4_attr(shard: &BgpShard, prefix: &str) -> Arc<BgpAttr> {
+        let prefix: Ipv4Net = prefix.parse().unwrap();
+        shard.v4.candidates(prefix)[0].attr.clone()
+    }
+
+    #[test]
+    fn route_batch_shares_one_attr_across_its_nlris() {
+        let mut shard = BgpShard::default();
+        shard.handle(ShardMsg::RouteBatchV4(ShardRouteBatchV4 {
+            ident: 2,
+            peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            typ: BgpRibType::EBGP,
+            from_client: false,
+            attr: Arc::new(attr_with_nh("192.0.2.1")),
+            nlris: vec![v4("10.0.0.0/24"), v4("10.0.1.0/24")],
+            enhe_egress: None,
+            stale: false,
+            nexthop_reachable: true,
+            compute_policy: true,
+        }));
+        let first = adj_in_v4_attr(&shard, 2, "10.0.0.0/24");
+        assert!(Arc::ptr_eq(
+            &first,
+            &adj_in_v4_attr(&shard, 2, "10.0.1.0/24")
+        ));
+        assert!(Arc::ptr_eq(&first, &loc_rib_v4_attr(&shard, "10.0.0.0/24")));
+        assert!(Arc::ptr_eq(&first, &loc_rib_v4_attr(&shard, "10.0.1.0/24")));
+        assert_eq!(shard.attr_store.len(), 1);
+    }
+
+    #[test]
+    fn updates_with_equal_attrs_share_one_attr() {
+        let mut shard = BgpShard::default();
+        shard.handle(update_v4(2, "10.0.0.0/24", "192.0.2.1", true));
+        shard.handle(update_v4(2, "10.0.1.0/24", "192.0.2.1", true));
+        shard.handle(update_v4(3, "10.0.0.0/24", "192.0.2.1", true));
+        let first = adj_in_v4_attr(&shard, 2, "10.0.0.0/24");
+        assert!(Arc::ptr_eq(
+            &first,
+            &adj_in_v4_attr(&shard, 2, "10.0.1.0/24")
+        ));
+        assert!(Arc::ptr_eq(
+            &first,
+            &adj_in_v4_attr(&shard, 3, "10.0.0.0/24")
+        ));
+        assert!(Arc::ptr_eq(&first, &loc_rib_v4_attr(&shard, "10.0.1.0/24")));
+        assert_eq!(shard.attr_store.len(), 1);
+    }
+
+    /// Inbound policy can change the attribute: the Adj-RIB-In row keeps
+    /// what the peer sent (soft-reconfig replays it), the Loc-RIB row
+    /// gets the changed set, and both are shared through the store.
+    #[test]
+    fn adj_in_keeps_the_pre_policy_attr() {
+        let sent = attr_with_nh("192.0.2.1");
+        let mut changed = sent.clone();
+        changed.med = Some(bgp_packet::Med::new(50));
+        let update = |prefix: &str| {
+            ShardMsg::UpdateV4(ShardUpdateV4 {
+                ident: 2,
+                rd: None,
+                nlri: v4(prefix),
+                peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                typ: BgpRibType::EBGP,
+                from_client: false,
+                attr: Arc::new(sent.clone()),
+                label: None,
+                nexthop: None,
+                enhe_egress: None,
+                stale: false,
+                nexthop_reachable: true,
+                vrf_transit_only: false,
+                decision: Some(PolicyDecision {
+                    attr: changed.clone(),
+                    weight: 0,
+                    tag: 0,
+                }),
+                compute_policy: false,
+            })
+        };
+        let mut shard = BgpShard::default();
+        shard.handle(update("10.0.0.0/24"));
+        shard.handle(update("10.0.1.0/24"));
+        let adj_in = adj_in_v4_attr(&shard, 2, "10.0.0.0/24");
+        let loc_rib = loc_rib_v4_attr(&shard, "10.0.0.0/24");
+        assert_eq!(*adj_in, sent);
+        assert_eq!(*loc_rib, changed);
+        assert!(Arc::ptr_eq(
+            &adj_in,
+            &adj_in_v4_attr(&shard, 2, "10.0.1.0/24")
+        ));
+        assert!(Arc::ptr_eq(
+            &loc_rib,
+            &loc_rib_v4_attr(&shard, "10.0.1.0/24")
+        ));
+        assert_eq!(shard.attr_store.len(), 2);
+    }
+
+    #[test]
+    fn update_v6_shares_attr_between_adj_in_and_loc_rib() {
+        let mut shard = BgpShard::default();
+        shard.handle(update_v6(2, "2001:db8:1::/48"));
+        shard.handle(update_v6(2, "2001:db8:2::/48"));
+        let attr = |prefix: &str| {
+            let prefix: ipnet::Ipv6Net = prefix.parse().unwrap();
+            let adj_in = shard.adj_in(2).unwrap().v6.0[&prefix][0].attr.clone();
+            let loc_rib = shard.v6.candidates(prefix)[0].attr.clone();
+            (adj_in, loc_rib)
+        };
+        let (adj_in, loc_rib) = attr("2001:db8:1::/48");
+        assert!(Arc::ptr_eq(&adj_in, &loc_rib));
+        assert!(Arc::ptr_eq(&adj_in, &attr("2001:db8:2::/48").0));
+        assert_eq!(shard.attr_store.len(), 1);
+    }
+
+    #[test]
+    fn peer_down_leaves_no_attr_in_use() {
+        let mut shard = BgpShard::default();
+        shard.handle(update_v4(2, "10.0.0.0/24", "192.0.2.1", true));
+        shard.handle(update_v4(2, "10.0.1.0/24", "192.0.2.2", true));
+        shard.handle(update_v6(2, "2001:db8:1::/48"));
+        let out = shard.handle(ShardMsg::PeerDown { ident: 2 });
+        drop(out);
+        assert_eq!(shard.attr_store.refcnt_all(), 0);
+        shard.attr_store.sweep();
+        assert_eq!(shard.attr_store.len(), 0);
     }
 }
