@@ -13,6 +13,7 @@ use super::{
 use crate::config::{Args, path_from_command};
 use crate::config::{ConfigChannel, ConfigOp, ConfigRequest, DisplayRequest, ShowChannel};
 use crate::context::{Timer, TimerType};
+use crate::exact_rows::ExactRows;
 use crate::fib::sysctl::sysctl_enable;
 use crate::fib::{FibChannel, FibHandle, FibMessage, FibNeighbor};
 use crate::fib::{fib_dump, fib_resync};
@@ -2186,7 +2187,7 @@ impl Rib {
         let entry = sid_rib_entry(sid);
         let entries = self.table_v6.entry(prefix).or_default();
         entries.retain(|e| !is_seg6local_entry(e));
-        entries.push(entry);
+        entries.push_exact(entry);
     }
 
     /// Remove a previously-inserted SID `RibEntry`. Must match the same
@@ -2195,6 +2196,7 @@ impl Rib {
         let prefix = sid.prefix();
         if let Some(entries) = self.table_v6.get_mut(&prefix) {
             entries.retain(|e| !is_seg6local_entry(e));
+            entries.shrink_to_fit();
         }
     }
 

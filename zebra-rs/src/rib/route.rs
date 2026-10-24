@@ -16,6 +16,7 @@ use super::{
     Group, GroupTrait, NexthopList, NexthopMap, NexthopMember, NexthopMulti, NexthopProtect,
     ProtectActive, RibEntries, RibType,
 };
+use crate::exact_rows::ExactRows;
 use std::net::IpAddr;
 
 /// Hold-down policy for kernel-driven address recovery.
@@ -2459,7 +2460,7 @@ fn rib_rtype_ifindex(entries: &[RibEntry], rtype: RibType, ifindex: u32) -> Opti
 
 fn rib_add(table: &mut PrefixMap<Ipv4Net, RibEntries>, prefix: &Ipv4Net, entry: RibEntry) {
     let entries = table.entry(*prefix).or_default();
-    entries.push(entry);
+    entries.push_exact(entry);
 }
 
 /// The kernel priorities `entry` is installed with: its next hop's
@@ -2491,7 +2492,7 @@ pub(crate) fn kernel_priorities(entry: &RibEntry, v6: bool) -> Vec<u32> {
 /// Linux does not send a delete when its route type changes.
 fn rib_add_kernel(entries: &mut RibEntries, mut entry: RibEntry) {
     if entry.kernel_append {
-        entries.push(entry);
+        entries.push_exact(entry);
         return;
     }
     if let Some(existing) = entries
@@ -2502,7 +2503,7 @@ fn rib_add_kernel(entries: &mut RibEntries, mut entry: RibEntry) {
         entry.fib = existing.fib;
         *existing = entry;
     } else {
-        entries.push(entry);
+        entries.push_exact(entry);
     }
 }
 
@@ -2555,7 +2556,7 @@ fn rib_replace_kernel(entries: &mut RibEntries, entry: &RibEntry, v6: bool) -> V
             .iter()
             .position(|e| same(e) && matches_legs(e))
             .or_else(|| entries.iter().position(same))
-            .map(|index| vec![entries.remove(index)])
+            .map(|index| vec![entries.remove_exact(index)])
             .unwrap_or_default();
     }
     let Some(index) = entries.iter().position(same) else {
@@ -2566,7 +2567,7 @@ fn rib_replace_kernel(entries: &mut RibEntries, entry: &RibEntry, v6: bool) -> V
         .filter(|leg| !gone.iter().any(|g| same_leg(leg, g)))
         .collect();
     if gone.is_empty() || remaining.is_empty() {
-        return vec![entries.remove(index)];
+        return vec![entries.remove_exact(index)];
     }
     let existing = &mut entries[index];
     existing.nexthop = if remaining.len() == 1 {
@@ -2595,7 +2596,7 @@ fn rib_add_system(table: &mut PrefixMap<Ipv4Net, RibEntries>, prefix: &Ipv4Net, 
     };
     match index {
         None => {
-            entries.push(entry);
+            entries.push_exact(entry);
         }
         Some(index) => {
             let e = entries.get_mut(index).unwrap();
@@ -2705,9 +2706,7 @@ fn rib_replace(
     let Some(entries) = table.get_mut(prefix) else {
         return vec![];
     };
-    let (remain, replace): (Vec<_>, Vec<_>) = entries.drain(..).partition(|x| x.rtype != rtype);
-    *entries = remain;
-    replace
+    take_entries(entries, |x| x.rtype == rtype)
 }
 
 /// Remove only the connected entry belonging to `ifindex`. Two interfaces
@@ -2722,11 +2721,16 @@ fn rib_replace_connected(
     let Some(entries) = table.get_mut(prefix) else {
         return vec![];
     };
-    let (remain, replace): (Vec<_>, Vec<_>) = entries
-        .drain(..)
-        .partition(|x| !(x.rtype == rtype && x.ifindex == ifindex));
+    take_entries(entries, |x| x.rtype == rtype && x.ifindex == ifindex)
+}
+
+/// Take out the entries for which `take` holds, keeping the rest in order and
+/// at their exact size.
+fn take_entries(entries: &mut RibEntries, take: impl Fn(&RibEntry) -> bool) -> Vec<RibEntry> {
+    let (taken, mut remain): (Vec<_>, Vec<_>) = entries.drain(..).partition(|x| take(x));
+    remain.shrink_to_fit();
     *entries = remain;
-    replace
+    taken
 }
 
 fn rib_prev(ribs: &RibEntries) -> Option<usize> {
@@ -2921,7 +2925,7 @@ async fn ipv6_entry_selection(
 
 fn rib_add_v6(table: &mut PrefixMap<Ipv6Net, RibEntries>, prefix: &Ipv6Net, entry: RibEntry) {
     let entries = table.entry(*prefix).or_default();
-    entries.push(entry);
+    entries.push_exact(entry);
 }
 
 fn rib_add_system_v6(
@@ -2942,7 +2946,7 @@ fn rib_add_system_v6(
     };
     match index {
         None => {
-            entries.push(entry);
+            entries.push_exact(entry);
         }
         Some(index) => {
             let e = entries.get_mut(index).unwrap();
@@ -3056,11 +3060,7 @@ fn rib_replace_connected_v6(
     let Some(entries) = table.get_mut(prefix) else {
         return vec![];
     };
-    let (remain, replace): (Vec<_>, Vec<_>) = entries
-        .drain(..)
-        .partition(|x| !(x.rtype == rtype && x.ifindex == ifindex));
-    *entries = remain;
-    replace
+    take_entries(entries, |x| x.rtype == rtype && x.ifindex == ifindex)
 }
 
 fn rib_replace_v6(
@@ -3071,9 +3071,7 @@ fn rib_replace_v6(
     let Some(entries) = table.get_mut(prefix) else {
         return vec![];
     };
-    let (remain, replace): (Vec<_>, Vec<_>) = entries.drain(..).partition(|x| x.rtype != rtype);
-    *entries = remain;
-    replace
+    take_entries(entries, |x| x.rtype == rtype)
 }
 
 pub async fn ipv6_route_sync(
@@ -4581,5 +4579,131 @@ mod tests {
         assert_eq!(u.addr, "2001:db8:3::2".parse::<IpAddr>().unwrap());
         assert_eq!(u.mpls_label, vec![16500, 15003, 15002]);
         assert!(!entry.is_fib());
+    }
+}
+
+#[cfg(test)]
+mod row_capacity_tests {
+    use super::*;
+
+    fn static_route() -> RibEntry {
+        RibEntry::new(RibType::Static)
+    }
+
+    fn kernel_route(metric: u32) -> RibEntry {
+        let mut entry = RibEntry::new(RibType::Kernel);
+        entry.metric = metric;
+        entry
+    }
+
+    fn v4() -> Ipv4Net {
+        "10.9.0.0/24".parse().unwrap()
+    }
+
+    fn v6() -> Ipv6Net {
+        "2001:db8:9::/48".parse().unwrap()
+    }
+
+    #[test]
+    fn rib_add_rows_are_exact() {
+        let mut table = PrefixMap::<Ipv4Net, RibEntries>::new();
+        rib_add(&mut table, &v4(), static_route());
+        assert_eq!(table.get(&v4()).unwrap().capacity(), 1);
+        rib_add(&mut table, &v4(), RibEntry::new(RibType::Bgp));
+        assert_eq!(table.get(&v4()).unwrap().capacity(), 2);
+        rib_add(&mut table, &v4(), RibEntry::new(RibType::Isis));
+        assert_eq!(table.get(&v4()).unwrap().capacity(), 3);
+    }
+
+    #[test]
+    fn rib_add_v6_rows_are_exact() {
+        let mut table = PrefixMap::<Ipv6Net, RibEntries>::new();
+        rib_add_v6(&mut table, &v6(), static_route());
+        assert_eq!(table.get(&v6()).unwrap().capacity(), 1);
+        rib_add_v6(&mut table, &v6(), RibEntry::new(RibType::Bgp));
+        assert_eq!(table.get(&v6()).unwrap().capacity(), 2);
+    }
+
+    #[test]
+    fn rib_add_system_rows_are_exact() {
+        let mut v4_table = PrefixMap::<Ipv4Net, RibEntries>::new();
+        rib_add_system(&mut v4_table, &v4(), static_route());
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 1);
+        rib_add_system(&mut v4_table, &v4(), kernel_route(10));
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 2);
+        let mut appended = kernel_route(10);
+        appended.kernel_append = true;
+        rib_add_system(&mut v4_table, &v4(), appended);
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 3);
+
+        let mut v6_table = PrefixMap::<Ipv6Net, RibEntries>::new();
+        rib_add_system_v6(&mut v6_table, &v6(), static_route());
+        assert_eq!(v6_table.get(&v6()).unwrap().capacity(), 1);
+        rib_add_system_v6(&mut v6_table, &v6(), kernel_route(10));
+        assert_eq!(v6_table.get(&v6()).unwrap().capacity(), 2);
+    }
+
+    #[test]
+    fn rib_replace_rows_are_exact() {
+        let mut v4_table = PrefixMap::<Ipv4Net, RibEntries>::new();
+        for rtype in [RibType::Static, RibType::Bgp, RibType::Isis] {
+            rib_add(&mut v4_table, &v4(), RibEntry::new(rtype));
+        }
+        assert_eq!(rib_replace(&mut v4_table, &v4(), RibType::Bgp).len(), 1);
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 2);
+        assert_eq!(rib_replace(&mut v4_table, &v4(), RibType::Static).len(), 1);
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 1);
+        assert_eq!(rib_replace(&mut v4_table, &v4(), RibType::Isis).len(), 1);
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 0);
+
+        let mut v6_table = PrefixMap::<Ipv6Net, RibEntries>::new();
+        for rtype in [RibType::Static, RibType::Bgp] {
+            rib_add_v6(&mut v6_table, &v6(), RibEntry::new(rtype));
+        }
+        assert_eq!(rib_replace_v6(&mut v6_table, &v6(), RibType::Bgp).len(), 1);
+        assert_eq!(v6_table.get(&v6()).unwrap().capacity(), 1);
+    }
+
+    #[test]
+    fn rib_replace_connected_rows_are_exact() {
+        let connected = |ifindex: u32| {
+            let mut entry = RibEntry::new(RibType::Connected);
+            entry.ifindex = ifindex;
+            entry
+        };
+        let mut v4_table = PrefixMap::<Ipv4Net, RibEntries>::new();
+        for ifindex in [1, 2, 3] {
+            rib_add(&mut v4_table, &v4(), connected(ifindex));
+        }
+        let removed = rib_replace_connected(&mut v4_table, &v4(), RibType::Connected, 2);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(v4_table.get(&v4()).unwrap().capacity(), 2);
+
+        let mut v6_table = PrefixMap::<Ipv6Net, RibEntries>::new();
+        for ifindex in [1, 2] {
+            rib_add_v6(&mut v6_table, &v6(), connected(ifindex));
+        }
+        let removed = rib_replace_connected_v6(&mut v6_table, &v6(), RibType::Connected, 2);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(v6_table.get(&v6()).unwrap().capacity(), 1);
+    }
+
+    #[test]
+    fn rib_replace_kernel_rows_are_exact() {
+        let mut entries = RibEntries::new();
+        for metric in [10, 20, 30] {
+            rib_add_kernel(&mut entries, kernel_route(metric));
+        }
+        assert_eq!(entries.capacity(), 3);
+        assert_eq!(
+            rib_replace_kernel(&mut entries, &kernel_route(20), false).len(),
+            1
+        );
+        assert_eq!(entries.capacity(), 2);
+        assert_eq!(
+            rib_replace_kernel(&mut entries, &kernel_route(10), true).len(),
+            1
+        );
+        assert_eq!(entries.capacity(), 1);
     }
 }
