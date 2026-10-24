@@ -17,6 +17,7 @@ mod bfd;
 mod bgp;
 mod config;
 mod context;
+mod exact_rows;
 use config::{Cli, ConfigManager};
 #[cfg(target_os = "linux")]
 mod cradle;

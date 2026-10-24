@@ -5,6 +5,7 @@ use bgp_packet::*;
 use ipnet::{Ipv4Net, Ipv6Net};
 
 use super::BgpRib;
+use crate::exact_rows::ExactRows;
 
 // Direction marker types for compile-time type safety
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +52,25 @@ impl RibDirection for Out {
     const ZERO_ID_WILDCARD: bool = true;
 }
 
+/// Store `route` in the row vector of its prefix: replace the row with the
+/// same direction-specific id and return the old one, or append.
+fn add_row<D: RibDirection>(rows: &mut Vec<BgpRib>, route: BgpRib) -> Option<BgpRib> {
+    let route_id = D::get_id(&route);
+    match rows.iter().position(|r| D::get_id(r) == route_id) {
+        Some(pos) => Some(std::mem::replace(&mut rows[pos], route)),
+        None => {
+            rows.push_exact(route);
+            None
+        }
+    }
+}
+
+/// Take the row with direction-specific id `id` out of `rows`.
+fn remove_row<D: RibDirection>(rows: &mut Vec<BgpRib>, id: u32) -> Option<BgpRib> {
+    let pos = rows.iter().position(|r| D::get_id(r) == id)?;
+    Some(rows.remove_exact(pos))
+}
+
 /// Per-AFI Adj-RIB table, generic over the prefix type `P` (defaults
 /// to `Ipv4Net` so existing `AdjRibTable<D>` uses are unchanged). The
 /// direction marker `D` selects which path-id field disambiguates
@@ -67,18 +87,7 @@ impl<D: RibDirection, P: Ord> AdjRibTable<D, P> {
     pub fn add(&mut self, prefix: P, route: BgpRib) -> Option<BgpRib> {
         let candidates = self.0.entry(prefix).or_default();
 
-        let route_id = D::get_id(&route);
-        // Find existing route with same ID (for AddPath support)
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == route_id) {
-            // Replace existing route with same ID and return the old one
-            let old_route = candidates[pos].clone();
-            candidates[pos] = route;
-            Some(old_route)
-        } else {
-            // No existing route with this ID, insert new route
-            candidates.push(route);
-            None
-        }
+        add_row::<D>(candidates, route)
     }
 
     // Remove a route using the direction-specific ID field
@@ -86,9 +95,7 @@ impl<D: RibDirection, P: Ord> AdjRibTable<D, P> {
         let candidates = self.0.get_mut(&prefix)?;
 
         // Find and remove route with matching ID
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == id) {
-            let removed_route = candidates.remove(pos);
-
+        if let Some(removed_route) = remove_row::<D>(candidates, id) {
             // Clean up empty vector
             if candidates.is_empty() {
                 self.0.remove(&prefix);
@@ -139,23 +146,13 @@ impl<D: RibDirection> AdjRibEvpnTable<D> {
     pub fn add(&mut self, prefix: EvpnPrefix, route: BgpRib) -> Option<BgpRib> {
         let candidates = self.0.entry(prefix).or_default();
 
-        let route_id = D::get_id(&route);
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == route_id) {
-            let old_route = candidates[pos].clone();
-            candidates[pos] = route;
-            Some(old_route)
-        } else {
-            candidates.push(route);
-            None
-        }
+        add_row::<D>(candidates, route)
     }
 
     pub fn remove(&mut self, prefix: &EvpnPrefix, id: u32) -> Option<BgpRib> {
         let candidates = self.0.get_mut(prefix)?;
 
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == id) {
-            let removed_route = candidates.remove(pos);
-
+        if let Some(removed_route) = remove_row::<D>(candidates, id) {
             if candidates.is_empty() {
                 self.0.remove(prefix);
             }
@@ -192,23 +189,13 @@ impl<D: RibDirection> AdjRibMupTable<D> {
     pub fn add(&mut self, prefix: MupPrefix, route: BgpRib) -> Option<BgpRib> {
         let candidates = self.0.entry(prefix).or_default();
 
-        let route_id = D::get_id(&route);
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == route_id) {
-            let old_route = candidates[pos].clone();
-            candidates[pos] = route;
-            Some(old_route)
-        } else {
-            candidates.push(route);
-            None
-        }
+        add_row::<D>(candidates, route)
     }
 
     pub fn remove(&mut self, prefix: &MupPrefix, id: u32) -> Option<BgpRib> {
         let candidates = self.0.get_mut(prefix)?;
 
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == id) {
-            let removed_route = candidates.remove(pos);
-
+        if let Some(removed_route) = remove_row::<D>(candidates, id) {
             if candidates.is_empty() {
                 self.0.remove(prefix);
             }
@@ -247,23 +234,13 @@ impl<D: RibDirection> AdjRibFlowspecTable<D> {
     pub fn add(&mut self, nlri: FlowspecNlri, route: BgpRib) -> Option<BgpRib> {
         let candidates = self.0.entry(nlri).or_default();
 
-        let route_id = D::get_id(&route);
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == route_id) {
-            let old_route = candidates[pos].clone();
-            candidates[pos] = route;
-            Some(old_route)
-        } else {
-            candidates.push(route);
-            None
-        }
+        add_row::<D>(candidates, route)
     }
 
     pub fn remove(&mut self, nlri: &FlowspecNlri, id: u32) -> Option<BgpRib> {
         let candidates = self.0.get_mut(nlri)?;
 
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == id) {
-            let removed_route = candidates.remove(pos);
-
+        if let Some(removed_route) = remove_row::<D>(candidates, id) {
             if candidates.is_empty() {
                 self.0.remove(nlri);
             }
@@ -300,23 +277,13 @@ impl<D: RibDirection> AdjRibBgpLsTable<D> {
     pub fn add(&mut self, nlri: BgpLsNlri, route: BgpRib) -> Option<BgpRib> {
         let candidates = self.0.entry(nlri).or_default();
 
-        let route_id = D::get_id(&route);
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == route_id) {
-            let old_route = candidates[pos].clone();
-            candidates[pos] = route;
-            Some(old_route)
-        } else {
-            candidates.push(route);
-            None
-        }
+        add_row::<D>(candidates, route)
     }
 
     pub fn remove(&mut self, nlri: &BgpLsNlri, id: u32) -> Option<BgpRib> {
         let candidates = self.0.get_mut(nlri)?;
 
-        if let Some(pos) = candidates.iter().position(|r| D::get_id(r) == id) {
-            let removed_route = candidates.remove(pos);
-
+        if let Some(removed_route) = remove_row::<D>(candidates, id) {
             if candidates.is_empty() {
                 self.0.remove(nlri);
             }
@@ -709,6 +676,10 @@ impl AdjRib<Out> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "row_capacity_tests.rs"]
+mod row_capacity_tests;
 
 #[cfg(test)]
 mod tests {

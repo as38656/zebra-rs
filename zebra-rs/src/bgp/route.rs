@@ -9,6 +9,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use prefix_trie::{Prefix, PrefixMap};
 
 use crate::bgp::timer::{start_adv_timer_evpn, start_stale_timer};
+use crate::exact_rows::ExactRows;
 use crate::policy::{AsPathPrependConfig, CommunityMatcher, PolicyList, StandardMatcher};
 use crate::rib::tracing::fib_l2_fdb;
 use crate::rib::{self, MacAddr, api::FdbEntry};
@@ -2450,7 +2451,7 @@ impl<P: Prefix + Copy> LocalRibTable<P> {
 
         next_id = new_rib.local_id;
 
-        cands.push(new_rib);
+        cands.push_exact(new_rib);
 
         let selected = self.select_best_path(prefix);
 
@@ -2462,6 +2463,7 @@ impl<P: Prefix + Copy> LocalRibTable<P> {
         let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
             .collect();
+        cands.shrink_to_fit();
         removed
     }
 
@@ -3027,7 +3029,7 @@ impl LocalRibEvpnTable {
 
         next_id = new_rib.local_id;
 
-        cands.push(new_rib);
+        cands.push_exact(new_rib);
 
         let selected = self.select_best_path(&prefix);
 
@@ -3036,9 +3038,11 @@ impl LocalRibEvpnTable {
 
     pub fn remove(&mut self, prefix: &EvpnPrefix, id: u32, ident: usize) -> Vec<BgpRib> {
         let cands = self.cands.entry(prefix.clone()).or_default();
-        cands
+        let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
-            .collect()
+            .collect();
+        cands.shrink_to_fit();
+        removed
     }
 
     pub fn select_best_path(&mut self, prefix: &EvpnPrefix) -> Vec<BgpRib> {
@@ -3127,7 +3131,7 @@ impl LocalRibMupTable {
 
         next_id = new_rib.local_id;
 
-        cands.push(new_rib);
+        cands.push_exact(new_rib);
 
         let selected = self.select_best_path(&prefix);
 
@@ -3136,9 +3140,11 @@ impl LocalRibMupTable {
 
     pub fn remove(&mut self, prefix: &MupPrefix, id: u32, ident: usize) -> Vec<BgpRib> {
         let cands = self.cands.entry(prefix.clone()).or_default();
-        cands
+        let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
-            .collect()
+            .collect();
+        cands.shrink_to_fit();
+        removed
     }
 
     pub fn select_best_path(&mut self, prefix: &MupPrefix) -> Vec<BgpRib> {
@@ -3232,7 +3238,7 @@ impl LocalRibFlowspecTable {
 
         next_id = new_rib.local_id;
 
-        cands.push(new_rib);
+        cands.push_exact(new_rib);
 
         let selected = self.select_best_path(&nlri);
 
@@ -3241,9 +3247,11 @@ impl LocalRibFlowspecTable {
 
     pub fn remove(&mut self, nlri: &FlowspecNlri, id: u32, ident: usize) -> Vec<BgpRib> {
         let cands = self.cands.entry(nlri.clone()).or_default();
-        cands
+        let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
-            .collect()
+            .collect();
+        cands.shrink_to_fit();
+        removed
     }
 
     pub fn select_best_path(&mut self, nlri: &FlowspecNlri) -> Vec<BgpRib> {
@@ -3330,7 +3338,7 @@ impl LocalRibBgpLsTable {
 
         next_id = new_rib.local_id;
 
-        cands.push(new_rib);
+        cands.push_exact(new_rib);
 
         let selected = self.select_best_path(&nlri);
 
@@ -3339,9 +3347,11 @@ impl LocalRibBgpLsTable {
 
     pub fn remove(&mut self, nlri: &BgpLsNlri, id: u32, ident: usize) -> Vec<BgpRib> {
         let cands = self.cands.entry(nlri.clone()).or_default();
-        cands
+        let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
-            .collect()
+            .collect();
+        cands.shrink_to_fit();
+        removed
     }
 
     pub fn select_best_path(&mut self, nlri: &BgpLsNlri) -> Vec<BgpRib> {
@@ -14580,6 +14590,7 @@ pub fn route_clean(
                         }
                         !refuse
                     });
+                    ribs.shrink_to_fit();
                 }
             }
             out
@@ -14761,6 +14772,7 @@ pub fn route_clean(
                         }
                         !refuse
                     });
+                    ribs.shrink_to_fit();
                 }
             }
             out
@@ -14911,6 +14923,7 @@ pub fn route_clean(
                         }
                         !refuse
                     });
+                    ribs.shrink_to_fit();
                 }
             }
             out

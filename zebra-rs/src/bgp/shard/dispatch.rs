@@ -20,6 +20,8 @@ use std::sync::Arc;
 use bgp_packet::{Ipv4Nlri, Ipv6Nlri, RouteDistinguisher};
 use ipnet::Ipv4Net;
 
+use crate::exact_rows::ExactRows;
+
 use super::super::route::BgpRib;
 use super::BgpShard;
 use super::msg::{
@@ -279,8 +281,9 @@ impl BgpShard {
             }
             if let Some(a) = added {
                 cands.retain(|r| !(r.ident == a.ident && r.remote_id == a.remote_id));
-                cands.push(a.clone());
+                cands.push_exact(a.clone());
             }
+            cands.shrink_to_fit();
             if cands.is_empty() {
                 self.v4.0.remove(&prefix);
             }
