@@ -385,7 +385,7 @@ impl Engine {
     /// the event-driven path stays pointer-consistent. The PET's `record_adj_out`
     /// twin.
     fn record_adj_out(&mut self, prefix: Ipv4Net, mut rib: BgpRib) {
-        rib.attr = self.attr_store.intern((*rib.attr).clone());
+        rib.attr = self.attr_store.intern_arc(rib.attr.clone());
         self.adj_out.add(prefix, rib);
     }
 

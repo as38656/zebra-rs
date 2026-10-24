@@ -8532,15 +8532,12 @@ fn show_bgp_attributes(
     if json {
         let mut attributes = Vec::new();
         for (label, store) in [("main", &bgp.attr_store), ("shard", &bgp.shard.attr_store)] {
-            for (attr, weak) in store.iter() {
-                let refcnt = weak.strong_count();
-                if refcnt > 0 {
-                    attributes.push(BgpAttrEntryJson {
-                        refcnt,
-                        store: label.to_string(),
-                        attr: format!("{}", attr),
-                    });
-                }
+            for (attr, refcnt) in store.iter() {
+                attributes.push(BgpAttrEntryJson {
+                    refcnt,
+                    store: label.to_string(),
+                    attr: format!("{}", attr),
+                });
             }
         }
         let view = BgpAttributesJson {
@@ -8569,12 +8566,9 @@ fn show_bgp_attributes(
     )?;
     writeln!(buf)?;
     for (label, store) in [("main", &bgp.attr_store), ("shard", &bgp.shard.attr_store)] {
-        for (attr, weak) in store.iter() {
-            let refcnt = weak.strong_count();
-            if refcnt > 0 {
-                writeln!(buf, "Refcnt: {} ({})", refcnt, label)?;
-                write!(buf, "{}", attr)?;
-            }
+        for (attr, refcnt) in store.iter() {
+            writeln!(buf, "Refcnt: {} ({})", refcnt, label)?;
+            write!(buf, "{}", attr)?;
         }
     }
     Ok(buf)

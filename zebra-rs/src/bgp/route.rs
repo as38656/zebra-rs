@@ -15180,6 +15180,11 @@ pub fn route_clean(
     {
         bgp.shard.adj_in_drop(peer_id);
     }
+
+    // The peer's routes are gone, so drop the attribute sets only they
+    // used. At N>1 the pool shards sweep their own stores as they grow.
+    bgp.shard.attr_store.sweep();
+    bgp.attr_store.sweep();
 }
 
 /// Reconstruct the wire `EvpnRoute` from a Loc-RIB / Adj-RIB entry,

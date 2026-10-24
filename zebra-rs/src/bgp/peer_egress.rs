@@ -277,7 +277,7 @@ impl Engine {
     /// the PET's own store so the dedup against the event-driven path
     /// (interned there too) stays pointer-consistent.
     fn record_adj_out(&mut self, prefix: Ipv4Net, mut rib: BgpRib) {
-        rib.attr = self.attr_store.intern((*rib.attr).clone());
+        rib.attr = self.attr_store.intern_arc(rib.attr.clone());
         self.adj_out.add(prefix, rib);
     }
 

@@ -127,6 +127,7 @@ restart-after-upgrade = true
 
 [dependencies]
 ahash = "0.8"
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
 anyhow.workspace = true
 bytes = "1"
 mimalloc = "0.1"
