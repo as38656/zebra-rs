@@ -163,7 +163,7 @@ fn fmt_group_for_trace(group: &Group) -> String {
 /// switchover swaps. Only the gid changes; address, metric, and encap
 /// stay the member's (and on `use_nhid == false` kernels the gid is
 /// never read, so this is inert there).
-fn protect_primary_nexthop(pro: &crate::rib::nexthop::NexthopProtect) -> Nexthop {
+pub(crate) fn protect_primary_nexthop(pro: &crate::rib::nexthop::NexthopProtect) -> Nexthop {
     let mut nh = pro.primary.as_nexthop();
     if pro.gid != 0
         && let Nexthop::Uni(u) = &mut nh

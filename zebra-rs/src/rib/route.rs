@@ -491,6 +491,7 @@ impl Rib {
         let Some(link) = self.links.get(&ifindex).cloned() else {
             return;
         };
+        self.kernel_removed(super::flush::link_nexthops(&self.nmap, ifindex));
 
         // Notify protocol daemons.
         self.api_link_down(ifindex);
@@ -1979,6 +1980,77 @@ fn ipv4_entry_resolve(entries: &mut RibEntries, nmap: &NexthopMap, ifdown: bool)
     }
 }
 
+/// How the kernel moves from a route it holds at a prefix to the entry
+/// newly selected there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handover {
+    /// The same route, which the kernel holds as one route: nothing to
+    /// write.
+    Keep,
+    /// The same kernel priorities: installing the new entry replaces the
+    /// old route in place (`NLM_F_REPLACE`), so no delete goes before it
+    /// and the prefix is never without a route.
+    Replace,
+    /// Delete the old route, then install the new entry.
+    Reinstall,
+}
+
+pub(crate) fn handover(installed: &RibEntry, next: &RibEntry, v6: bool) -> Handover {
+    let ours = |entry: &RibEntry| entry.is_protocol() && !is_bridge_type5(entry);
+    if !ours(installed) || !ours(next) {
+        return Handover::Reinstall;
+    }
+    let priorities = |entry: &RibEntry| {
+        let mut priorities = kernel_priorities(entry, v6);
+        priorities.sort_unstable();
+        priorities
+    };
+    let held = priorities(installed);
+    // A link that goes down can take one route of several priorities and
+    // leave the others (`flush::routes_removed`).
+    if held.len() == 1 && installed.rtype == next.rtype && installed.nexthop == next.nexthop {
+        return Handover::Keep;
+    }
+    if held == priorities(next) {
+        Handover::Replace
+    } else {
+        Handover::Reinstall
+    }
+}
+
+/// The route in the kernel that the newly selected entry takes over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// `replace[i]`, the entry its own protocol just replaced.
+    Replaced(usize),
+    /// The entry selected before, which `next` outranks now.
+    Prev,
+}
+
+/// The route the kernel holds that `entries[next]` can take over
+/// without deleting it first (`Handover::Keep` or `Handover::Replace`),
+/// if there is one.
+fn takeover(
+    replace: &[RibEntry],
+    entries: &RibEntries,
+    prev: Option<usize>,
+    next: Option<usize>,
+    v6: bool,
+) -> Option<(Source, Handover)> {
+    let next = next?;
+    if prev == Some(next) {
+        return None;
+    }
+    let held = replace
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| (Source::Replaced(i), entry))
+        .chain(prev.map(|i| (Source::Prev, &entries[i])));
+    held.filter(|(_, entry)| entry.is_fib())
+        .map(|(source, entry)| (source, handover(entry, &entries[next], v6)))
+        .find(|(_, step)| *step != Handover::Reinstall)
+}
+
 /// Returns `true` when a route install came back from the kernel as a
 /// failure and we forced a nexthop recreation — the caller should
 /// schedule another resolve pass so the recreated nexthop and the
@@ -1992,9 +2064,27 @@ async fn ipv4_entry_selection(
     table_id: u32,
     ifdown: bool,
 ) -> bool {
+    // Selected.
+    let prev = rib_prev(entries);
+    let next = rib_next(entries);
+    let takeover = if ifdown {
+        None
+    } else {
+        takeover(&replace, entries, prev, next, false)
+    };
+    let offloaded = match takeover {
+        Some((Source::Replaced(i), _)) => replace[i].offloaded,
+        Some((Source::Prev, _)) => prev.is_some_and(|i| entries[i].offloaded),
+        None => false,
+    };
+    let mut handed_over = None;
     // An earlier run's route the protocol's own replaced, or the sweep
     // withdrew: out of the kernel, before the new one goes in.
-    for mut replace in replace {
+    for (i, mut replace) in replace.into_iter().enumerate() {
+        if takeover.is_some_and(|(source, _)| source == Source::Replaced(i)) {
+            handed_over = Some(replace);
+            continue;
+        }
         if replace.stale && !ifdown {
             fib.route_del_leftover((*prefix).into(), &replace, table_id)
                 .await;
@@ -2009,9 +2099,6 @@ async fn ipv4_entry_selection(
             replace.nexthop_unsync(nmap, fib).await;
         }
     }
-    // Selected.
-    let prev = rib_prev(entries);
-    let next = rib_next(entries);
 
     if prev == next {
         // No selection change. The selected route may still be missing
@@ -2037,6 +2124,7 @@ async fn ipv4_entry_selection(
         // Dump order must not withdraw a backup while both candidates
         // are leftovers waiting for their owners to converge.
         let keep_leftover = entries[prev].stale && next.is_some_and(|i| entries[i].stale);
+        let taken_over = takeover.is_some_and(|(source, _)| source == Source::Prev);
         let prev = entries.get_mut(prev).unwrap();
         prev.set_selected(false);
         if !keep_leftover {
@@ -2044,7 +2132,7 @@ async fn ipv4_entry_selection(
                 // An earlier run's route, outranked: out of the kernel.
                 fib.route_del_leftover((*prefix).into(), prev, table_id)
                     .await;
-            } else if !ifdown {
+            } else if !ifdown && !taken_over {
                 fib.route_ipv4_del(prefix, prev, table_id).await;
             }
             prev.set_fib(false);
@@ -2055,7 +2143,10 @@ async fn ipv4_entry_selection(
         let next = entries.get_mut(next).unwrap();
         next.set_selected(true);
 
-        if next.is_protocol() {
+        if takeover.is_some_and(|(_, step)| step == Handover::Keep) {
+            next.set_fib(true);
+            next.offloaded = offloaded;
+        } else if next.is_protocol() {
             next.nexthop_sync(nmap, fib).await;
             let ok = fib.route_ipv4_add(prefix, next, table_id).await;
             next.set_fib(ok);
@@ -2074,6 +2165,11 @@ async fn ipv4_entry_selection(
                 .await;
             next.set_fib(true);
         }
+    }
+    // Only now: deleting a next-hop object that a route still names takes
+    // the route out of the kernel with it.
+    if let Some(mut entry) = handed_over {
+        entry.nexthop_unsync(nmap, fib).await;
     }
     retry
 }
@@ -2828,8 +2924,30 @@ async fn ipv6_entry_selection(
         }
     }
 
+    // Selected.
+    let prev = rib_prev(entries);
+
+    // New select.
+    let next = rib_next(entries);
+    let link_local = prefix.addr().is_unicast_link_local();
+    let takeover = if link_local {
+        None
+    } else {
+        takeover(&replace, entries, prev, next, true)
+    };
+    let offloaded = match takeover {
+        Some((Source::Replaced(i), _)) => replace[i].offloaded,
+        Some((Source::Prev, _)) => prev.is_some_and(|i| entries[i].offloaded),
+        None => false,
+    };
+    let mut handed_over = None;
+
     // As the v4 twin: an earlier run's route, replaced or swept.
-    for mut replace in replace {
+    for (i, mut replace) in replace.into_iter().enumerate() {
+        if takeover.is_some_and(|(source, _)| source == Source::Replaced(i)) {
+            handed_over = Some(replace);
+            continue;
+        }
         if replace.stale {
             fib.route_del_leftover((*prefix).into(), &replace, table_id)
                 .await;
@@ -2848,7 +2966,7 @@ async fn ipv6_entry_selection(
     // Link-local prefixes (fe80::/10) are link-scoped: every interface
     // legitimately holds the same fe80::/64, and best-route selection would
     // arbitrarily flag only one. Mark every valid entry as selected+FIB.
-    if prefix.addr().is_unicast_link_local() {
+    if link_local {
         for entry in entries.iter_mut() {
             let on = entry.is_valid();
             entry.set_selected(on);
@@ -2856,12 +2974,6 @@ async fn ipv6_entry_selection(
         }
         return false;
     }
-
-    // Selected.
-    let prev = rib_prev(entries);
-
-    // New select.
-    let next = rib_next(entries);
 
     if rib_route() {
         println!("[ipv6_entry_selection] prev={:?} next={:?}", prev, next);
@@ -2886,6 +2998,7 @@ async fn ipv6_entry_selection(
     }
     if let Some(prev) = prev {
         let keep_leftover = entries[prev].stale && next.is_some_and(|i| entries[i].stale);
+        let taken_over = takeover.is_some_and(|(source, _)| source == Source::Prev);
         let prev = entries.get_mut(prev).unwrap();
         prev.set_selected(false);
 
@@ -2893,7 +3006,7 @@ async fn ipv6_entry_selection(
             if prev.stale {
                 fib.route_del_leftover((*prefix).into(), prev, table_id)
                     .await;
-            } else {
+            } else if !taken_over {
                 fib.route_ipv6_del(prefix, prev, table_id).await;
             }
             prev.set_fib(false);
@@ -2904,7 +3017,10 @@ async fn ipv6_entry_selection(
         let next = entries.get_mut(next).unwrap();
         next.set_selected(true);
 
-        if next.is_protocol() {
+        if takeover.is_some_and(|(_, step)| step == Handover::Keep) {
+            next.set_fib(true);
+            next.offloaded = offloaded;
+        } else if next.is_protocol() {
             next.nexthop_sync(nmap, fib).await;
             let ok = fib.route_ipv6_add(prefix, next, table_id).await;
             next.set_fib(ok);
@@ -2919,6 +3035,9 @@ async fn ipv6_entry_selection(
                 .await;
             next.set_fib(true);
         }
+    }
+    if let Some(mut entry) = handed_over {
+        entry.nexthop_unsync(nmap, fib).await;
     }
     retry
 }
@@ -3383,6 +3502,167 @@ mod tests {
         RecoveryDecision, SuppressReason, addr_recover_decide,
     };
     use std::time::{Duration, Instant};
+
+    fn uni_route(rtype: super::RibType, metric: u32, gid: usize) -> super::RibEntry {
+        let mut entry = super::RibEntry::new(rtype);
+        entry.metric = metric;
+        entry.valid = true;
+        entry.nexthop = super::Nexthop::Uni(super::NexthopUni {
+            addr: "192.0.2.1".parse().unwrap(),
+            metric,
+            gid,
+            valid: true,
+            ..Default::default()
+        });
+        entry
+    }
+
+    /// An entry the kernel holds now.
+    fn installed(rtype: super::RibType, metric: u32, gid: usize) -> super::RibEntry {
+        let mut entry = uni_route(rtype, metric, gid);
+        entry.selected = true;
+        entry.fib = true;
+        entry
+    }
+
+    #[test]
+    fn a_new_entry_keeps_replaces_or_reinstalls_the_route_before_it() {
+        use super::*;
+        let old = installed(RibType::Bgp, 20, 7);
+        // The same protocol and next hop: the kernel has it already.
+        let same = uni_route(RibType::Bgp, 20, 7);
+        assert_eq!(handover(&old, &same, false), Handover::Keep);
+        // Another next hop, or another protocol, at the same priority: the
+        // install replaces the route in place.
+        let moved = uni_route(RibType::Bgp, 20, 8);
+        assert_eq!(handover(&old, &moved, false), Handover::Replace);
+        let other = uni_route(RibType::Isis, 20, 7);
+        assert_eq!(handover(&old, &other, false), Handover::Replace);
+        // Another priority is another kernel route.
+        let farther = uni_route(RibType::Bgp, 30, 7);
+        assert_eq!(handover(&old, &farther, false), Handover::Reinstall);
+        // An earlier run's leftover is no route of ours to replace.
+        let mut stale = old.clone();
+        stale.stale = true;
+        assert_eq!(handover(&stale, &same, false), Handover::Reinstall);
+        // IPv6 has no priority 0: the kernel keeps such a route at 1024.
+        let zero = installed(RibType::Bgp, 0, 7);
+        let at_1024 = uni_route(RibType::Bgp, 1024, 8);
+        assert_eq!(handover(&zero, &at_1024, true), Handover::Replace);
+        assert_eq!(handover(&zero, &at_1024, false), Handover::Reinstall);
+        // A route of several priorities replaces in place only when the new
+        // entry has all of them and no other.
+        let list = |metrics: &[u32]| {
+            let mut entry = uni_route(RibType::Static, metrics[0], 7);
+            entry.nexthop = Nexthop::List(NexthopList {
+                nexthops: metrics
+                    .iter()
+                    .map(|metric| {
+                        NexthopMember::Uni(NexthopUni {
+                            metric: *metric,
+                            gid: 7,
+                            ..Default::default()
+                        })
+                    })
+                    .collect(),
+            });
+            entry
+        };
+        let mut both = list(&[10, 20]);
+        both.fib = true;
+        let mut moved = list(&[10, 20]);
+        if let Nexthop::List(l) = &mut moved.nexthop {
+            l.nexthops[1] = NexthopMember::Uni(NexthopUni {
+                metric: 20,
+                gid: 8,
+                ..Default::default()
+            });
+        }
+        assert_eq!(handover(&both, &moved, false), Handover::Replace);
+        assert_eq!(handover(&both, &list(&[10]), false), Handover::Reinstall);
+        // A link that went down may have taken one of its routes, so the
+        // same route of several priorities is written again.
+        assert_eq!(handover(&both, &list(&[10, 20]), false), Handover::Replace);
+    }
+
+    #[test]
+    fn a_new_entry_takes_over_the_route_the_kernel_holds() {
+        use super::*;
+        // Its own protocol replaced the installed entry.
+        let entries: RibEntries = vec![uni_route(RibType::Bgp, 20, 7)];
+        let replaced = [installed(RibType::Bgp, 20, 7)];
+        assert_eq!(
+            takeover(&replaced, &entries, None, Some(0), false),
+            Some((Source::Replaced(0), Handover::Keep))
+        );
+        // A replaced entry the kernel does not hold is nothing to take over.
+        let mut not_installed = replaced[0].clone();
+        not_installed.fib = false;
+        assert_eq!(
+            takeover(&[not_installed], &entries, None, Some(0), false),
+            None
+        );
+        // It outranks the entry selected before, at the same priority.
+        let entries: RibEntries = vec![
+            installed(RibType::Isis, 20, 7),
+            uni_route(RibType::Static, 20, 8),
+        ];
+        assert_eq!(
+            takeover(&[], &entries, Some(0), Some(1), false),
+            Some((Source::Prev, Handover::Replace))
+        );
+        // At another priority the old route is deleted first.
+        let entries: RibEntries = vec![
+            installed(RibType::Isis, 20, 7),
+            uni_route(RibType::Static, 10, 8),
+        ];
+        assert_eq!(takeover(&[], &entries, Some(0), Some(1), false), None);
+        // Nothing changes hands when the selection stays, or when nothing
+        // is selected any more.
+        assert_eq!(takeover(&[], &entries, Some(0), Some(0), false), None);
+        assert_eq!(takeover(&replaced, &entries, Some(0), None, false), None);
+        // A route the kernel owns (connected) is never installed by us.
+        let mut connected = RibEntry::new(RibType::Connected);
+        connected.valid = true;
+        let entries: RibEntries = vec![connected];
+        assert_eq!(takeover(&replaced, &entries, None, Some(0), false), None);
+    }
+
+    /// BGP sends the same route again after the link its next hop resolved
+    /// to went down. The kernel removed the route with the link, so the new
+    /// entry is written again.
+    #[test]
+    fn a_route_the_kernel_removed_with_its_link_is_written_again() {
+        use super::super::GroupUni;
+        use super::super::flush::{link_nexthops, nexthops_removed, routes_removed};
+        use super::*;
+        let mut nmap = NexthopMap::default();
+        let mut group = GroupUni::new(
+            7,
+            &NexthopUni {
+                addr: "192.0.2.1".parse().unwrap(),
+                ..Default::default()
+            },
+            RT_TABLE_MAIN,
+        );
+        group.ifindex_resolved = Some(5);
+        let mut group = Group::Uni(group);
+        group.set_valid(true);
+        group.set_installed(true);
+        nmap.groups.resize_with(8, || None);
+        nmap.groups[7] = Some(group);
+        let prefix: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let mut table: PrefixMap<Ipv4Net, RibEntries> = PrefixMap::new();
+        table.insert(prefix, vec![installed(RibType::Bgp, 20, 7)]);
+
+        let on_link = link_nexthops(&nmap, 5);
+        let removed = nexthops_removed(&mut nmap, on_link);
+        routes_removed(&mut table, &removed);
+
+        let replaced = table.get(&prefix).unwrap().clone();
+        let entries: RibEntries = vec![uni_route(RibType::Bgp, 20, 7)];
+        assert_eq!(takeover(&replaced, &entries, None, Some(0), false), None);
+    }
 
     /// Linux semantics at one priority: IPv4 keeps routes side by side
     /// (`ip route append`), and deletes one by its next hops; IPv6 merges

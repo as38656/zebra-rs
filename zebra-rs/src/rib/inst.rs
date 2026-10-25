@@ -4817,22 +4817,19 @@ impl Rib {
     /// becomes unreachable. Without this hook our `NexthopMap` keeps
     /// the group flagged `installed`, so the next resolve cycle skips
     /// re-creating it and routes pointing at the now-missing nh_id fail
-    /// to install with EINVAL. Clearing `installed` lets the debounced
-    /// resolve rebuild the nexthop (and re-add its dependent routes).
+    /// to install with EINVAL. Taking the group and its routes out of the
+    /// kernel in our view lets the debounced resolve rebuild the nexthop
+    /// and re-add those routes.
     /// Our own deletes echo back here too, but by then the group is
     /// gone or the flag already clear, so it's a no-op.
     fn fib_nexthop_removed(&mut self, id: u32) {
-        let cleared = self.nmap.get_mut(id as usize).is_some_and(|group| {
-            let was_installed = group.is_installed();
-            if was_installed {
-                group.set_installed(false);
-            }
-            was_installed
-        });
-        if cleared {
-            tracing::info!("fib: kernel removed nexthop id {id}; scheduling reinstall");
-            self.schedule_rib_sync();
+        let id = id as usize;
+        if !self.nmap.get(id).is_some_and(|group| group.is_installed()) {
+            return;
         }
+        self.kernel_removed(BTreeSet::from([id]));
+        tracing::info!("fib: kernel removed nexthop id {id}; scheduling reinstall");
+        self.schedule_rib_sync();
     }
 
     /// Record the forwarding plane's verdict on a route.
