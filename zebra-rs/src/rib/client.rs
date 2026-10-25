@@ -65,7 +65,7 @@ impl ProtoId {
     /// allocator at spawn time — the central mint point. Direct
     /// construction is fine because `ProtoId` carries no invariant
     /// beyond uniqueness, which the allocator enforces.
-    pub fn from_raw(id: u32) -> Self {
+    pub const fn from_raw(id: u32) -> Self {
         Self(id)
     }
 }

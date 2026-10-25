@@ -1,6 +1,7 @@
 use super::api::{FdbEntry, RibRx};
 use super::client::{ClientRegistry, ProtoId, RibInbound};
 use super::entry::RibEntry;
+use super::inbound::{InboundQueue, Lane};
 use super::link::{LinkConfig, link_config_exec};
 use super::{
     Block, BlockBuilder, BlockConfig, BridgeBuilder, BridgeConfig, DEFAULT_BLOCK_NAME, GroupTrait,
@@ -1248,11 +1249,14 @@ pub struct Rib {
     /// `ConfigManager` into every `RibClient` it hands out at
     /// subscribe time.
     pub inbound_tx: UnboundedSender<RibInbound>,
-    /// Receive half polled in `event_loop`. Each `RibInbound` is
-    /// unwrapped and forwarded to `process_msg` exactly like the
-    /// legacy `rx` channel. The `from: ProtoId` field routes
-    /// per-VRF installs through the inbound dispatcher.
+    /// Receive half polled in `event_loop`. Each `RibInbound` waits in
+    /// `inbound` first, then is unwrapped and forwarded to
+    /// `process_msg` like the legacy `rx` channel. The `from: ProtoId`
+    /// field routes per-VRF installs through the inbound dispatcher.
     pub inbound_rx: UnboundedReceiver<RibInbound>,
+    /// What came in on `inbound_rx` and is not handled yet, ordered and
+    /// merged ([`InboundQueue`]).
+    pub inbound: InboundQueue,
     /// Per-proto redistribute subscription registry. Outer key is the
     /// subscriber's protocol name (matches `Subscriber::proto`); inner
     /// map is keyed by `(afi, rtype)` and holds the subtype filter set
@@ -1540,6 +1544,7 @@ impl Rib {
             client_registry: ClientRegistry::new(),
             inbound_tx,
             inbound_rx,
+            inbound: InboundQueue::new(),
             redist_filters: HashMap::new(),
             redist_default_watch: HashMap::new(),
             redist_table_watch: BTreeMap::new(),
@@ -6197,7 +6202,12 @@ impl Rib {
                     self.process_msg(msg, RT_TABLE_MAIN).await;
                 }
                 Some(env) = self.inbound_rx.recv() => {
-                    self.process_inbound(env).await;
+                    self.inbound_take(env);
+                }
+                _ = std::future::ready(()), if !self.inbound.is_empty() => {
+                    if let Some(env) = self.inbound.pop() {
+                        self.process_inbound(env).await;
+                    }
                 }
                 Some(msg) = self.fib.rx.recv() => {
                     // Overrun is intercepted here rather than inside
@@ -6222,6 +6232,21 @@ impl Rib {
 }
 
 impl Rib {
+    /// Queue `env` and everything else `inbound_rx` holds now, so the
+    /// queue can order and merge the whole burst.
+    fn inbound_take(&mut self, env: RibInbound) {
+        self.inbound_push(env);
+        while let Ok(env) = self.inbound_rx.try_recv() {
+            self.inbound_push(env);
+        }
+    }
+
+    fn inbound_push(&mut self, env: RibInbound) {
+        let proto = self.client_registry.subscriber(env.from);
+        let lane = Lane::of_proto(proto.map(|sub| sub.proto.as_str()));
+        self.inbound.push(env, lane);
+    }
+
     /// Handle an envelope from a protocol instance. An envelope from an
     /// instance that has been cleaned up is dropped
     /// (`ClientRegistry::is_retired`): it was sent before the instance
@@ -7908,6 +7933,50 @@ mod label_claim_tests {
             Ok(RibRx::LabelGranted { label: 15000 })
         ));
         assert_eq!(holder.allocate(), Some(15001), "15000 is OSPF's");
+    }
+}
+
+#[cfg(test)]
+mod inbound_order_tests {
+    use super::*;
+    use crate::rib::client::{ProtoId, RibClient};
+
+    fn instance(rib: &mut Rib, id: u32, proto: &str) -> (RibClient, ProtoId) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = ProtoId::from_raw(id);
+        rib.subscribe(id, tx, proto.to_string(), 0, false);
+        (RibClient::new(rib.inbound_tx.clone(), id), id)
+    }
+
+    fn bgp_route(prefix: &str) -> Message {
+        Message::Ipv4Add {
+            prefix: prefix.parse().unwrap(),
+            rib: RibEntry::new(RibType::Bgp),
+        }
+    }
+
+    /// A burst of BGP routes is taken in whole, a newer route of the same
+    /// prefix drops the older one, and an IS-IS change sent after the
+    /// burst is handled before it.
+    #[tokio::test]
+    async fn an_igp_change_goes_before_a_queued_bgp_burst() {
+        let mut rib = Rib::new(false).expect("rib");
+        let (bgp, _) = instance(&mut rib, 1, "bgp:vrf:INET");
+        let (isis, isis_id) = instance(&mut rib, 2, "isis");
+        for prefix in ["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24", "10.0.0.0/24"] {
+            bgp.send(bgp_route(prefix)).unwrap();
+        }
+        let mut locator = RibEntry::new(RibType::Isis);
+        locator.metric = 10;
+        isis.send(Message::Ipv6Del {
+            prefix: "5f00:5000:1::/48".parse().unwrap(),
+            rib: locator,
+        })
+        .unwrap();
+        let first = rib.inbound_rx.recv().await.unwrap();
+        rib.inbound_take(first);
+        assert_eq!(rib.inbound.len(), 4);
+        assert_eq!(rib.inbound.pop().map(|env| env.from), Some(isis_id));
     }
 }
 

@@ -10,6 +10,8 @@ pub mod client;
 // names; using `crate::rib::client::*` from callsites avoids
 // `unused_imports`.
 
+pub mod inbound;
+
 pub mod inst;
 pub use inst::{EsNhgMember, Message, Rib, XconnectRemote, serve};
 
