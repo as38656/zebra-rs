@@ -236,67 +236,58 @@ pub fn graph(
         // rib-builder only consumes first_hop_links anyway.
         let own_router_lsp = *is_originated && !lsp.lsp_id.is_pseudo();
 
-        let mut position = 0;
-        for tlv in &lsp.tlvs {
-            if let IsisTlv::ExtIsReach(ext_reach) = tlv {
-                for entry in &ext_reach.entries {
-                    let entry_key = (lsp.lsp_id, position);
-                    position += 1;
-                    let neighbor_lsp_id: IsisLspId = entry.neighbor_id.into();
+        for (position, entry) in ReachTopology::Base.entries(lsp).enumerate() {
+            let neighbor_lsp_id: IsisLspId = entry.neighbor_id.into();
 
-                    // RFC 9666 §3.2: classify the edge and resolve
-                    // proxy-pointing adjacencies.
-                    let mut metric = entry.metric;
-                    if let Some((inside, proxy_id)) = proxy_ctx.as_ref() {
-                        if entry.neighbor_id.sys_id() == *proxy_id {
-                            // An outside router's adjacency toward the
-                            // proxy: materialize an inter-area edge to
-                            // every Inside Edge Router advertising this
-                            // outside router, restoring two-way
-                            // connectivity for the inside SPF.
-                            let cost = super::area_proxy::encode_inter_metric(entry.metric);
-                            for &edge_id in boundary_rev.get(neighbor_id).into_iter().flatten() {
-                                let link = spf::Link::with_id(node_id, edge_id, cost, 0);
-                                if let Some(from) = graph.get_mut(&node_id) {
-                                    from.olinks.push(link.clone());
-                                }
-                                if let Some(to) = graph.get_mut(&edge_id) {
-                                    to.ilinks.push(link);
-                                }
-                            }
-                            continue;
+            // RFC 9666 §3.2: classify the edge and resolve
+            // proxy-pointing adjacencies.
+            let mut metric = entry.metric;
+            if let Some((inside, proxy_id)) = proxy_ctx.as_ref() {
+                if entry.neighbor_id.sys_id() == *proxy_id {
+                    // An outside router's adjacency toward the
+                    // proxy: materialize an inter-area edge to
+                    // every Inside Edge Router advertising this
+                    // outside router, restoring two-way
+                    // connectivity for the inside SPF.
+                    let cost = super::area_proxy::encode_inter_metric(entry.metric);
+                    for &edge_id in boundary_rev.get(neighbor_id).into_iter().flatten() {
+                        let link = spf::Link::with_id(node_id, edge_id, cost, 0);
+                        if let Some(from) = graph.get_mut(&node_id) {
+                            from.olinks.push(link.clone());
                         }
-                        let from_inside = inside.contains(&neighbor_id.sys_id());
-                        let to_inside = inside.contains(&entry.neighbor_id.sys_id());
-                        metric = if from_inside && to_inside {
-                            super::area_proxy::encode_intra_metric(metric)
-                        } else {
-                            super::area_proxy::encode_inter_metric(metric)
-                        };
+                        if let Some(to) = graph.get_mut(&edge_id) {
+                            to.ilinks.push(link);
+                        }
                     }
-
-                    if top.lsdb.get(&level).get(&neighbor_lsp_id).is_none() {
-                        continue;
-                    }
-                    let to_id = top
-                        .lsp_map
-                        .get_mut(&level)
-                        .get(&neighbor_lsp_id.neighbor_id());
-
-                    let link_id = if own_router_lsp {
-                        own_ifindex.get(&entry_key).copied().unwrap_or(0)
-                    } else {
-                        0
-                    };
-
-                    let link = spf::Link::with_id(node_id, to_id, metric, link_id);
-                    if let Some(from_id) = graph.get_mut(&node_id) {
-                        from_id.olinks.push(link.clone());
-                    }
-                    if let Some(to_id) = graph.get_mut(&to_id) {
-                        to_id.ilinks.push(link);
-                    }
+                    continue;
                 }
+                let from_inside = inside.contains(&neighbor_id.sys_id());
+                let to_inside = inside.contains(&entry.neighbor_id.sys_id());
+                metric = if from_inside && to_inside {
+                    super::area_proxy::encode_intra_metric(metric)
+                } else {
+                    super::area_proxy::encode_inter_metric(metric)
+                };
+            }
+
+            if top.lsdb.get(&level).get(&neighbor_lsp_id).is_none() {
+                continue;
+            }
+            let Some(link_id) = edge_link_id(own_router_lsp, &own_ifindex, (lsp.lsp_id, position))
+            else {
+                continue;
+            };
+            let to_id = top
+                .lsp_map
+                .get_mut(&level)
+                .get(&neighbor_lsp_id.neighbor_id());
+
+            let link = spf::Link::with_id(node_id, to_id, metric, link_id);
+            if let Some(from_id) = graph.get_mut(&node_id) {
+                from_id.olinks.push(link.clone());
+            }
+            if let Some(to_id) = graph.get_mut(&to_id) {
+                to_id.ilinks.push(link);
             }
         }
     }
@@ -547,13 +538,9 @@ fn process_outgoing_links_mt2(
     // rib-builder resolves to a local interface; edges from other
     // routers' LSPs carry link_id = 0, as in graph().
     for (position, entry) in ReachTopology::Mt2.entries(lsp).enumerate() {
-        let link_id = if own_router_lsp {
-            own_ifindex
-                .get(&(lsp.lsp_id, position))
-                .copied()
-                .unwrap_or(0)
-        } else {
-            0
+        let Some(link_id) = edge_link_id(own_router_lsp, own_ifindex, (lsp.lsp_id, position))
+        else {
+            continue;
         };
         process_neighbor_link_mt2(top, level, from_id, entry, link_id, links);
     }
@@ -694,63 +681,54 @@ pub fn graph_flex_algo(
         let node_id = top.lsp_map.get_mut(&level).get(neighbor_id);
         let own_router_lsp = *is_originated && !lsp.lsp_id.is_pseudo();
 
-        let mut position = 0;
-        for tlv in &lsp.tlvs {
-            let IsisTlv::ExtIsReach(ext_reach) = tlv else {
+        for (position, entry_reach) in ReachTopology::Base.entries(lsp).enumerate() {
+            let neighbor_lsp_id: IsisLspId = entry_reach.neighbor_id.into();
+
+            if top.lsdb.get(&level).get(&neighbor_lsp_id).is_none() {
+                continue;
+            }
+
+            let Some(link_id) = edge_link_id(own_router_lsp, &own_ifindex, (lsp.lsp_id, position))
+            else {
                 continue;
             };
-            for entry_reach in &ext_reach.entries {
-                let own_ifx = if own_router_lsp {
-                    own_ifindex.get(&(lsp.lsp_id, position)).copied()
-                } else {
-                    None
-                };
-                position += 1;
-                let neighbor_lsp_id: IsisLspId = entry_reach.neighbor_id.into();
 
-                if top.lsdb.get(&level).get(&neighbor_lsp_id).is_none() {
-                    continue;
+            if link_prune_reason(&advertised_link_attrs(entry_reach), constraints).is_some() {
+                continue;
+            }
+
+            // Edge cost per the FAD metric-type (RFC 9350 §5.1).
+            // metric-type 1 routes on the link's Min delay, as RFC 9479
+            // §4.2 selects it from what the link advertises — never a
+            // legacy inline value the applicable ASLA did not point to.
+            // Our own links too: costed from the interface's current
+            // delay, a link whose delay we do not advertise — a Min
+            // configured without a Max, one changed since our LSP was
+            // flooded — stayed in our topology at a cost no other
+            // router saw, or at all where every other router pruned
+            // it, and routers computing one algorithm differently loop.
+            // A link that advertises no delay is pruned (RFC 9350 §15).
+            // Everything else uses the IGP metric.
+            let cost = if constraints.metric_type == FadMetricType::MinUnidirLinkDelay {
+                match super::flex_algo::peer_min_delay(entry_reach) {
+                    Some(d) => d,
+                    None => continue,
                 }
+            } else {
+                entry_reach.metric
+            };
 
-                if link_prune_reason(&advertised_link_attrs(entry_reach), constraints).is_some() {
-                    continue;
-                }
+            let to_id = top
+                .lsp_map
+                .get_mut(&level)
+                .get(&neighbor_lsp_id.neighbor_id());
 
-                // Edge cost per the FAD metric-type (RFC 9350 §5.1).
-                // metric-type 1 routes on the link's Min delay, as RFC 9479
-                // §4.2 selects it from what the link advertises — never a
-                // legacy inline value the applicable ASLA did not point to.
-                // Our own links too: costed from the interface's current
-                // delay, a link whose delay we do not advertise — a Min
-                // configured without a Max, one changed since our LSP was
-                // flooded — stayed in our topology at a cost no other
-                // router saw, or at all where every other router pruned
-                // it, and routers computing one algorithm differently loop.
-                // A link that advertises no delay is pruned (RFC 9350 §15).
-                // Everything else uses the IGP metric.
-                let cost = if constraints.metric_type == FadMetricType::MinUnidirLinkDelay {
-                    match super::flex_algo::peer_min_delay(entry_reach) {
-                        Some(d) => d,
-                        None => continue,
-                    }
-                } else {
-                    entry_reach.metric
-                };
-
-                let to_id = top
-                    .lsp_map
-                    .get_mut(&level)
-                    .get(&neighbor_lsp_id.neighbor_id());
-
-                let link_id = own_ifx.unwrap_or(0);
-
-                let link = spf::Link::with_id(node_id, to_id, cost, link_id);
-                if let Some(from) = graph.get_mut(&node_id) {
-                    from.olinks.push(link.clone());
-                }
-                if let Some(to) = graph.get_mut(&to_id) {
-                    to.ilinks.push(link);
-                }
+            let link = spf::Link::with_id(node_id, to_id, cost, link_id);
+            if let Some(from) = graph.get_mut(&node_id) {
+                from.olinks.push(link.clone());
+            }
+            if let Some(to) = graph.get_mut(&to_id) {
+                to.ilinks.push(link);
             }
         }
     }
@@ -804,10 +782,12 @@ impl ReachTopology {
 /// neighbour alone cannot say which interface an entry is: keyed by it,
 /// SPF's cheaper parallel link installed the expensive one, and a
 /// Flex-Algorithm's surviving link its pruned twin. Each entry takes an
-/// unused interface adjacent to its neighbour, preferring the one whose
-/// metric and current attributes are what the entry advertises; parallel
-/// links that differ therefore pair exactly, and identical ones still get
-/// one interface each.
+/// unused interface with an adjacency up to its neighbour. First every
+/// entry takes one whose metric and current attributes are what the entry
+/// advertises, then the rest take any one left. So parallel links that
+/// differ pair exactly, identical ones still get one interface each, and
+/// an entry for a link whose adjacency went down cannot take the
+/// interface of a live one. An entry with no interface left is not paired.
 fn own_entry_interfaces<'a>(
     own: impl Iterator<Item = &'a IsisLsp>,
     links: &IsisLinks,
@@ -815,40 +795,64 @@ fn own_entry_interfaces<'a>(
     level: Level,
     topology: ReachTopology,
 ) -> BTreeMap<(IsisLspId, usize), u32> {
+    let entries: Vec<((IsisLspId, usize), &IsisTlvExtIsReachEntry)> = own
+        .flat_map(|lsp| {
+            topology
+                .entries(lsp)
+                .enumerate()
+                .map(move |(position, entry)| ((lsp.lsp_id, position), entry))
+        })
+        .collect();
+    let adjacent = |link: &IsisLink, entry: &IsisTlvExtIsReachEntry| {
+        topology.link_metric(link).is_some()
+            && link
+                .state
+                .adj
+                .get(&level)
+                .as_ref()
+                .is_some_and(|(adj, _)| *adj == entry.neighbor_id)
+    };
+    let advertises = |link: &IsisLink, entry: &IsisTlvExtIsReachEntry| {
+        topology.link_metric(link) == Some(entry.metric)
+            && own_link_attrs(link, am) == advertised_link_attrs(entry)
+    };
     let mut used = BTreeSet::new();
     let mut out = BTreeMap::new();
-    for lsp in own {
-        for (position, entry) in topology.entries(lsp).enumerate() {
-            let candidates: Vec<(u32, &IsisLink)> = links
-                .iter()
-                .filter(|(ifindex, link)| {
-                    !used.contains(*ifindex)
-                        && topology.link_metric(link).is_some()
-                        && link
-                            .state
-                            .adj
-                            .get(&level)
-                            .as_ref()
-                            .is_some_and(|(adj, _)| *adj == entry.neighbor_id)
-                })
-                .map(|(ifindex, link)| (*ifindex, link))
-                .collect();
-            let advertised = advertised_link_attrs(entry);
-            let chosen = candidates
-                .iter()
-                .find(|(_, link)| {
-                    topology.link_metric(link) == Some(entry.metric)
-                        && own_link_attrs(link, am) == advertised
-                })
-                .or(candidates.first())
-                .map(|(ifindex, _)| *ifindex);
-            if let Some(ifindex) = chosen {
-                used.insert(ifindex);
-                out.insert((lsp.lsp_id, position), ifindex);
+    for exact_only in [true, false] {
+        for (key, entry) in &entries {
+            if out.contains_key(key) {
+                continue;
+            }
+            let chosen = links.iter().find(|(ifindex, link)| {
+                !used.contains(*ifindex)
+                    && adjacent(link, entry)
+                    && (!exact_only || advertises(link, entry))
+            });
+            if let Some((ifindex, _)) = chosen {
+                used.insert(*ifindex);
+                out.insert(*key, *ifindex);
             }
         }
     }
     out
+}
+
+/// The link_id of the edge from reach entry `key`. For our own router LSP
+/// it is the interface `own_entry_interfaces` paired the entry with, and
+/// none when there is no such interface: until our LSP is made again, it
+/// still lists a neighbour whose adjacency went down, and SPF must not use
+/// a first hop that has no adjacency (ISO 10589 Annex C takes our first
+/// hops from the adjacency database). For every other LSP it is 0.
+fn edge_link_id(
+    own_router_lsp: bool,
+    own_ifindex: &BTreeMap<(IsisLspId, usize), u32>,
+    key: (IsisLspId, usize),
+) -> Option<u32> {
+    if own_router_lsp {
+        own_ifindex.get(&key).copied()
+    } else {
+        Some(0)
+    }
 }
 
 /// The attributes this router advertises for one of its links — the ASLA

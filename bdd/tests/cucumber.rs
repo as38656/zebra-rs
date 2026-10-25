@@ -3960,6 +3960,45 @@ async fn kernel_route_eventually_contains(
     );
 }
 
+#[then(
+    expr = "kernel route {string} in vrf {string} in namespace {string} should eventually contain {string}"
+)]
+async fn kernel_vrf_route_eventually_contains(
+    world: &mut World,
+    prefix: String,
+    vrf: String,
+    namespace: String,
+    needle: String,
+) {
+    let scoped = world.ns(&namespace);
+    let family = route_family_flag(&prefix);
+    const ATTEMPTS: u32 = 30;
+    let mut last_output = String::new();
+    for i in 0..ATTEMPTS {
+        last_output = netns::exec_in_netns(
+            &scoped,
+            "ip",
+            &[family, "route", "show", "vrf", &vrf, &prefix],
+        )
+        .await
+        .expect("Failed to run ip route show vrf");
+        if last_output.contains(&needle) {
+            println!(
+                "✓ kernel route {} in vrf {} in namespace {} contains '{}'",
+                prefix, vrf, scoped, needle
+            );
+            return;
+        }
+        if i + 1 < ATTEMPTS {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "kernel route {} in vrf {} in namespace {} did not contain '{}' after {} attempts\nlast output:\n{}",
+        prefix, vrf, scoped, needle, ATTEMPTS, last_output
+    );
+}
+
 /// Negative sibling of `kernel_route_eventually_contains`: poll until the
 /// kernel's `ip route show <prefix>` rendering no longer contains
 /// `needle`, while the prefix itself may remain — e.g. a withdrawn ECMP
@@ -4189,6 +4228,108 @@ async fn kernel_route_eventually_gone(world: &mut World, prefix: String, namespa
     panic!(
         "kernel route {} in namespace {} still present after {} attempts\nlast `ip route show {}` output:\n{}\n{}",
         prefix, scoped, ATTEMPTS, prefix, last_output, diag
+    );
+}
+
+fn route_record_path(scoped: &str) -> String {
+    format!("logs/{}.routes", scoped)
+}
+
+/// Record, in the background, every kernel route change in `namespace` with
+/// its time, for a later `... should not have been missing ...` step. The
+/// recorder is bounded by `timeout` because namespace deletion does not kill
+/// it.
+#[when(expr = "I start recording kernel route changes in namespace {string}")]
+async fn start_route_record(world: &mut World, namespace: String) {
+    let scoped = world.ns(&namespace);
+    let path = route_record_path(&scoped);
+    let _ = netns::exec_in_netns(&scoped, "rm", &["-f", &path]).await;
+    let _child = netns::spawn_in_netns(
+        &scoped,
+        "timeout",
+        &[
+            "300",
+            "sh",
+            "-c",
+            &format!("exec ip -ts monitor route >{}", path),
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("Failed to start ip monitor in {}: {}", scoped, e));
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    println!("✓ recording kernel route changes of {} in {}", scoped, path);
+}
+
+/// Seconds since midnight of an `ip -ts` stamp such as
+/// `[2026-10-24T13:11:19.405398]`.
+fn route_record_time(stamp: &str) -> Option<f64> {
+    let time = stamp.trim_start_matches('[').trim_end_matches(']');
+    let (_, clock) = time.split_once('T')?;
+    let mut parts = clock.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// Fail when the recording shows `prefix` deleted and not added back within
+/// `max_ms`. A delete that an add follows at once is how a route is replaced,
+/// so only the time between them counts.
+#[then(
+    expr = "kernel route {string} in namespace {string} should not have been missing for more than {int} ms"
+)]
+async fn kernel_route_not_missing(
+    world: &mut World,
+    prefix: String,
+    namespace: String,
+    max_ms: u64,
+) {
+    let scoped = world.ns(&namespace);
+    let path = route_record_path(&scoped);
+    let record = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read route recording {}: {}", path, e));
+    let deleted = format!("Deleted {} ", prefix);
+    let added = format!("{} ", prefix);
+    let mut events = Vec::new();
+    let mut missing_since: Option<f64> = None;
+    let mut longest_ms = 0.0_f64;
+    for line in record.lines().filter(|l| l.starts_with('[')) {
+        let Some((stamp, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(t) = route_record_time(stamp) else {
+            continue;
+        };
+        if rest.starts_with(&deleted) {
+            events.push(line.to_string());
+            missing_since.get_or_insert(t);
+        } else if rest.starts_with(&added) {
+            events.push(line.to_string());
+            if let Some(since) = missing_since.take() {
+                longest_ms = longest_ms.max((t - since) * 1000.0);
+            }
+        }
+    }
+    let history = events.join("\n");
+    assert!(
+        missing_since.is_none(),
+        "kernel route {} in {} was deleted and never added back:\n{}",
+        prefix,
+        scoped,
+        history
+    );
+    assert!(
+        longest_ms <= max_ms as f64,
+        "kernel route {} in {} was missing for {:.1} ms (limit {} ms):\n{}",
+        prefix,
+        scoped,
+        longest_ms,
+        max_ms,
+        history
+    );
+    println!(
+        "✓ kernel route {} in {} was missing for at most {:.1} ms",
+        prefix, scoped, longest_ms
     );
 }
 

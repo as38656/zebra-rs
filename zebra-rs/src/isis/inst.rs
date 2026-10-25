@@ -5298,6 +5298,174 @@ mod parallel_link_graph_tests {
 }
 
 #[cfg(test)]
+mod stale_own_edge_graph_tests {
+    use std::collections::BTreeSet;
+
+    use super::commit_and_microloop_gate_tests::fresh_isis;
+    use super::*;
+    use crate::isis::flex_algo::FadConstraints;
+    use crate::isis::graph::{graph, graph_flex_algo, graph_mt2};
+    use crate::isis::link::{IsisLink, LinkConfig, LinkState, LinkTimer};
+    use crate::isis::lsdb::Lsa;
+    use crate::spf::{Graph, SpfOpt};
+
+    const US: u8 = 0;
+
+    fn node(isis: &Isis, n: u8) -> IsisSysId {
+        if n == US {
+            isis.config.net.sys_id()
+        } else {
+            IsisSysId {
+                id: [0, 0, 0, 0, 0, n],
+            }
+        }
+    }
+
+    /// Our router with one IPv6-enabled point-to-point link per `(ifindex,
+    /// peer, metric, up)`, where `up` tells whether its adjacency is still
+    /// up, and one router LSP per `(router, [(neighbour, metric)])`, `US`
+    /// being ours. Each LSP lists its neighbours in TLV 22 and in MT 2's
+    /// TLV 222, and every peer is in MT 2 and in algorithm 128.
+    fn topology(links: &[(u32, u8, u32, bool)], lsps: &[(u8, &[(u8, u32)])]) -> Isis {
+        let mut isis = fresh_isis();
+        for &(ifindex, peer, metric, up) in links {
+            let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
+            Box::leak(Box::new(prx));
+            let mut link = IsisLink {
+                ifindex,
+                ptx,
+                read_task: tokio::spawn(async {}),
+                flags: netlink_packet_route::link::LinkFlags::empty(),
+                circuit_id: 0,
+                config: LinkConfig::default(),
+                state: LinkState::default(),
+                timer: LinkTimer::default(),
+            };
+            if up {
+                let neighbor = IsisNeighborId::from_sys_id(&node(&isis, peer), 0);
+                *link.state.adj.get_mut(&Level::L2) = Some((neighbor, None));
+            }
+            link.config.metric = Some(metric);
+            link.config.mt_metrics.insert(MtId::Ipv6Unicast, metric);
+            link.config.enable.v6 = true;
+            isis.links.insert(ifindex, link);
+        }
+        for &(router, neighbors) in lsps {
+            let sys = node(&isis, router);
+            let entries: Vec<IsisTlvExtIsReachEntry> = neighbors
+                .iter()
+                .map(|&(neighbor, metric)| IsisTlvExtIsReachEntry {
+                    neighbor_id: IsisNeighborId::from_sys_id(&node(&isis, neighbor), 0),
+                    metric,
+                    subs: Vec::new(),
+                })
+                .collect();
+            let lsp = IsisLsp {
+                lsp_id: IsisLspId::new(sys, 0, 0),
+                hold_time: 1200,
+                tlvs: vec![
+                    IsisTlv::ExtIsReach(IsisTlvExtIsReach {
+                        entries: entries.clone(),
+                    }),
+                    IsisTlv::MtIsReach(IsisTlvMtIsReach {
+                        mt: MultiTopologyId::from(MtId::Ipv6Unicast.wire_id()),
+                        entries,
+                    }),
+                ],
+                ..Default::default()
+            };
+            let mut lsa = Lsa::new(lsp);
+            lsa.originated = router == US;
+            isis.lsdb
+                .get_mut(&Level::L2)
+                .map
+                .insert(lsa.lsp.lsp_id, lsa);
+            if router != US {
+                isis.mt_membership
+                    .get_mut(&Level::L2)
+                    .insert(sys, BTreeSet::from([MtId::Ipv6Unicast]));
+                isis.peer_algos
+                    .get_mut(&Level::L2)
+                    .insert(sys, BTreeSet::from([128]));
+            }
+        }
+        isis
+    }
+
+    fn graphs(isis: &mut Isis) -> Vec<(&'static str, Graph, usize)> {
+        let base = graph(&mut isis.top(), Level::L2);
+        let mt2 = graph_mt2(&mut isis.top(), Level::L2);
+        let algo = graph_flex_algo(&mut isis.top(), Level::L2, 128, &FadConstraints::default());
+        [("base", base), ("mt2", mt2), ("algo 128", algo)]
+            .into_iter()
+            .map(|(name, (graph, source, _))| (name, graph, source.expect("our router")))
+            .collect()
+    }
+
+    /// BFD takes our adjacency to a down, and SPF can run before our LSP
+    /// is made again, while it still lists a. That edge has no interface,
+    /// so SPF took it as a's first hop and the RIB got no route to a —
+    /// and BGP withdrew every VPN route whose SID is a's — though a is
+    /// still reachable through c. Every graph leaves the edge out and
+    /// reaches a through c.
+    #[tokio::test]
+    async fn an_own_edge_without_adjacency_is_no_first_hop() {
+        let (a, c) = (9, 10);
+        let mut isis = topology(
+            &[(7, a, 10, false), (8, c, 10, true)],
+            &[
+                (US, &[(a, 10), (c, 10)]),
+                (a, &[(US, 10), (c, 10)]),
+                (c, &[(US, 10), (a, 10)]),
+            ],
+        );
+        let a_sys = node(&isis, a).to_string();
+        for (name, graph, source) in graphs(&mut isis) {
+            let a = graph
+                .iter()
+                .find(|(_, vertex)| vertex.sys_id == a_sys)
+                .map(|(id, _)| *id)
+                .expect("a");
+            let tree = crate::spf::spf(&graph, source, &SpfOpt::full_path());
+            let first_hops: BTreeSet<u32> = tree[&a]
+                .first_hop_links
+                .iter()
+                .map(|(_, link_id)| *link_id)
+                .collect();
+            assert_eq!(
+                (tree[&a].cost, first_hops),
+                (20, BTreeSet::from([8])),
+                "{name}"
+            );
+        }
+    }
+
+    /// The same with parallel links to one peer: the adjacency on the
+    /// cheap link is down and our LSP still lists both. The stale entry
+    /// took the other link's interface, so SPF used that link at the
+    /// stale metric. Whichever order our LSP lists them in, only the live
+    /// link is an edge, at its own metric.
+    #[tokio::test]
+    async fn a_stale_parallel_entry_takes_no_live_interface() {
+        let p = 9;
+        for order in [[(p, 10), (p, 100)], [(p, 100), (p, 10)]] {
+            let mut isis = topology(
+                &[(7, p, 10, false), (8, p, 100, true)],
+                &[(US, &order), (p, &[(US, 10), (US, 100)])],
+            );
+            for (name, graph, source) in graphs(&mut isis) {
+                let edges: BTreeSet<(u32, u32)> = graph[&source]
+                    .olinks
+                    .iter()
+                    .map(|link| (link.cost, link.link_id))
+                    .collect();
+                assert_eq!(edges, BTreeSet::from([(100, 8)]), "{name} {order:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod flex_algo_graph_tests {
     use std::collections::BTreeSet;
 

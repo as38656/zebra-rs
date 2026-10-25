@@ -1,0 +1,100 @@
+# a — PE that exports the customer prefixes of VRF cust as VPNv4/VPNv6.
+# Core links to b and c are IS-IS point-to-point over link-local addresses
+# with BFD, like the multi-site lab this feature comes from.
+vrf:
+- name: cust
+  ipv4:
+    route-target:
+      import:
+      - 65000:100
+      export:
+      - 65000:100
+  ipv6:
+    route-target:
+      import:
+      - 65000:100
+      export:
+      - 65000:100
+interface:
+- if-name: lo
+  ipv6:
+    address: 2001:db8::1/128
+segment-routing:
+  locator:
+  - name: LOC1
+    prefix: fcbb:bbbb:1::/48
+    behavior: usid
+router:
+  static:
+    vrf:
+    - name: cust
+      ipv4:
+        route:
+        - prefix: 192.0.2.64/26
+          nexthop:
+          - address: blackhole
+      ipv6:
+        route:
+        - prefix: 2001:db8:e1::/48
+          nexthop:
+          - address: blackhole
+  isis:
+    net: 49.0000.0000.0000.0001.00
+    hostname: a
+    is-type: level-2-only
+    lsp-gen-interval:
+      secondary-wait: 200
+      maximum-wait: 2000
+    spf-interval:
+      maximum-wait: 2000
+    segment-routing:
+      srv6:
+        locator: LOC1
+    interface:
+    - if-name: lo
+      ipv6:
+        enabled: true
+    - if-name: t-b
+      network-type: point-to-point
+      metric: 10
+      ipv6:
+        enabled: true
+      bfd:
+        enabled: true
+    - if-name: t-c
+      network-type: point-to-point
+      metric: 10
+      ipv6:
+        enabled: true
+      bfd:
+        enabled: true
+  bgp:
+    global:
+      as: 65000
+      router-id: 10.0.0.1
+    segment-routing:
+      srv6:
+        locator: LOC1
+    neighbor:
+    - remote-address: 2001:db8::2
+      remote-as: 65000
+      update-source: 2001:db8::1
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: vpnv4
+        enabled: true
+      - name: vpnv6
+        enabled: true
+    vrf:
+    - name: cust
+      rd: 65000:1
+      encapsulation: srv6
+      afi-safi:
+        ipv4:
+          network:
+          - prefix: 192.0.2.64/26
+        ipv6:
+          network:
+          - prefix: 2001:db8:e1::/48
