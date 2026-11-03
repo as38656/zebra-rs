@@ -2112,11 +2112,13 @@ impl BgpVrf {
             std::net::SocketAddr::V6(addr) if addr.scope_id() != 0 => Some(addr.scope_id()),
             _ => None,
         };
-        if let Some(stream) =
-            super::super::peer::handle_peer_connection(&mut self.peers, peer_addr, scope_id, stream)
-        {
+        match super::super::peer::inbound_peer(&self.peers, peer_addr, scope_id) {
+            Some(ident) => self.process_msg(Message::Event(
+                ident,
+                super::super::peer::Event::Accepted(stream),
+            )),
             // No matching peer in this VRF — drop, closing the TCP.
-            drop(stream);
+            None => drop(stream),
         }
     }
 

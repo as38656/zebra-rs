@@ -2,7 +2,7 @@
 # (10.2.0.2 sorts above 10.1.0.2). This is the peer the ident bug broke:
 # PE1 armed its idle-hold timer under ident 0, so the Start landed on
 # CE1's peer instead and this one sat in Idle forever — never dialling,
-# and (because `handle_peer_connection` drops inbound streams for an
+# and (because `fsm_accepted` drops inbound streams for an
 # Idle peer) never accepting CE2's dial either.
 interface:
 - if-name: lo

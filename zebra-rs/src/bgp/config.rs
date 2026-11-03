@@ -4261,7 +4261,7 @@ fn config_transport_passive(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Opti
 /// `start()` a moment before this leaf): re-running the timer
 /// reconciler flips it straight to Active — listening, never dialing.
 /// Without this, an inbound connection landing in that ≤5s Idle window
-/// is dropped by `handle_peer_connection` (Idle refuses connections)
+/// is dropped by `fsm_accepted` (Idle refuses connections)
 /// and the remote parks on its 120s connect-retry timer.
 pub(super) fn apply_passive(peer: &mut Peer, want: bool) -> bool {
     // Dynamic listen-range peers are passive-only, no matter the group.

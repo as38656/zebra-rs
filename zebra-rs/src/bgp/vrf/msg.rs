@@ -47,7 +47,7 @@ pub enum BgpVrfMsg {
     /// matches a peer configured in this VRF. The global accept
     /// dispatcher hands the stream off here; `process_global_msg`
     /// drives it through the per-VRF passive-accept FSM path
-    /// (`peer::handle_peer_connection` against the VRF's own peers).
+    /// (`peer::Event::Accepted` against the VRF's own peers).
     Accept(TcpStream, SocketAddr),
 
     /// Add a CE peer to a running VRF task (`router bgp vrf <name>

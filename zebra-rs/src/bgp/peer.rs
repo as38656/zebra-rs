@@ -116,6 +116,9 @@ pub struct CollisionConn {
     /// dead. Processed if this conn takes the session over
     /// (`fall_back_to_collision`).
     pub open: Option<OpenPacket>,
+    /// This conn's OpenSent hold timer: armed when our OPEN went out on
+    /// it, stopped when the remote's OPEN arrives.
+    pub opensent_hold_timer: Option<Timer>,
 }
 
 impl State {
@@ -142,10 +145,16 @@ pub enum Event {
     Stop,                  // 2
     ConnRetryTimerExpires, // 9
     HoldTimerExpires,      // 10
+    /// RFC 4271 §8.2.2 HoldTimer of one connection that sent our OPEN
+    /// and waits for the remote's. Carries the connection's id like the
+    /// wire events.
+    OpenSentHoldTimerExpires(ConnId),
     KeepaliveTimerExpires, // 11
     IdleHoldTimerExpires,  // 13
     Connected(TcpStream),  // 17
-    ConnFail(ConnId),      // 18
+    /// An inbound connection we accepted.
+    Accepted(TcpStream),
+    ConnFail(ConnId), // 18
     /// An active dial failed before any connection existed, so no
     /// `ConnId` was ever minted. Handled only in Connect — a stale
     /// dial failure must not tear down a session that superseded it.
@@ -260,6 +269,9 @@ pub struct PeerTimer {
     pub idle_hold_timer: Option<Timer>,
     pub connect_retry: Option<Timer>,
     pub hold_timer: Option<Timer>,
+    /// The primary conn's OpenSent hold timer. A parked conn has its
+    /// own (`CollisionConn::opensent_hold_timer`).
+    pub opensent_hold_timer: Option<Timer>,
     pub keepalive: Option<Timer>,
     pub min_as_origin: Option<Timer>,
     pub min_route_adv: Option<Timer>,
@@ -2088,10 +2100,21 @@ fn resolve_conn(peer: &Peer, id: ConnId) -> Option<ConnTag> {
 pub fn fsm_next_state(peer: &mut Peer, event: Event) -> (State, FsmEffect) {
     match event {
         Event::ConfigUpdate => (peer.state, FsmEffect::None),
-        Event::Start => (fsm_start(peer), FsmEffect::None),
+        Event::Start => match peer.state {
+            State::Idle | State::Connect | State::Active => (fsm_start(peer), FsmEffect::None),
+            // RFC 4271 §8.2.2 ignores a start event once a connection is
+            // up. A Start queued before that must not dial beside it.
+            State::OpenSent | State::OpenConfirm | State::Established => {
+                (peer.state, FsmEffect::None)
+            }
+        },
         Event::Stop => (fsm_stop(peer), FsmEffect::None),
         Event::ConnRetryTimerExpires => (fsm_conn_retry_expires(peer), FsmEffect::None),
         Event::HoldTimerExpires => (fsm_holdtimer_expires(peer), FsmEffect::None),
+        Event::OpenSentHoldTimerExpires(id) => match resolve_conn(peer, id) {
+            Some(conn) => (fsm_opensent_holdtimer_expires(peer, conn), FsmEffect::None),
+            None => (peer.state, FsmEffect::None),
+        },
         Event::KeepaliveTimerExpires => (fsm_keepalive_expires(peer), FsmEffect::None),
         Event::IdleHoldTimerExpires => (fsm_idle_hold_timer_expires(peer), FsmEffect::None),
         Event::Connected(stream) => match peer.state {
@@ -2111,7 +2134,7 @@ pub fn fsm_next_state(peer: &mut Peer, event: Event) -> (State, FsmEffect) {
             // stray OPEN/Cease that followed knocked one side to Idle
             // while the other sat in Active, both redialling in 5s
             // lockstep. Mirror image of the inbound-accept arm in
-            // `handle_peer_connection`; a third connection (primary
+            // `fsm_accepted`; a third connection (primary
             // already Active, or a collision already parked) is
             // dropped, as two conns is the RFC max.
             State::OpenSent | State::OpenConfirm => {
@@ -2127,6 +2150,7 @@ pub fn fsm_next_state(peer: &mut Peer, event: Event) -> (State, FsmEffect) {
                 (peer.state, FsmEffect::None)
             }
         },
+        Event::Accepted(stream) => (fsm_accepted(peer, stream), FsmEffect::None),
         Event::ConnFail(id) => match resolve_conn(peer, id) {
             Some(conn) => (fsm_conn_fail(peer, conn), FsmEffect::None),
             None => (peer.state, FsmEffect::None),
@@ -2524,6 +2548,7 @@ fn promote_collision_to_primary(peer: &mut Peer, collision: CollisionConn) {
     peer.task.writer = Some(collision.writer);
     peer.primary_role = Some(collision.role);
     peer.primary_conn_id = Some(collision.conn_id);
+    peer.timer.opensent_hold_timer = collision.opensent_hold_timer;
     // Show the surviving connection's endpoints, not the dead
     // primary's (the collision conn is always accepted, so its
     // local port is the listen port and its remote port ephemeral).
@@ -2535,8 +2560,23 @@ fn promote_collision_to_primary(peer: &mut Peer, collision: CollisionConn) {
     }
 }
 
+/// The OpenSent hold timer slot of the conn `conn` resolves to; `None`
+/// when no conn is parked.
+fn opensent_hold_timer(peer: &mut Peer, conn: ConnTag) -> Option<&mut Option<Timer>> {
+    match conn {
+        ConnTag::Primary => Some(&mut peer.timer.opensent_hold_timer),
+        ConnTag::Collision => peer
+            .collision
+            .as_mut()
+            .map(|collision| &mut collision.opensent_hold_timer),
+    }
+}
+
 pub fn fsm_bgp_open(peer: &mut Peer, conn: ConnTag, packet: OpenPacket) -> State {
     peer.counter[BgpType::Open as usize].rcvd += 1;
+    if let Some(timer) = opensent_hold_timer(peer, conn) {
+        *timer = None;
+    }
     process_open(peer, conn, packet)
 }
 
@@ -2961,7 +3001,7 @@ fn record_session_mss(peer: &mut Peer, stream: &TcpStream) {
 
 pub fn fsm_connected(peer: &mut Peer, role: Role, stream: TcpStream) -> State {
     // RFC 4271: Idle refuses all connections (the accept path already
-    // drops inbound streams in Idle — see `handle_peer_connection`).
+    // drops inbound streams in Idle — see `fsm_accepted`).
     // A Connected event can still arrive here from a dial whose
     // completion was queued just before the peer fell back to Idle;
     // promoting it would resurrect a session the FSM has torn down,
@@ -2979,7 +3019,7 @@ pub fn fsm_connected(peer: &mut Peer, role: Role, stream: TcpStream) -> State {
     apply_session_ttl(peer, &stream);
     record_session_mss(peer, &stream);
     // This is our dial, done; an inbound one leaves ours in flight (see
-    // `handle_peer_connection`).
+    // `fsm_accepted`).
     if role == Role::Active {
         peer.task.connect = None;
     }
@@ -2996,6 +3036,7 @@ pub fn fsm_connected(peer: &mut Peer, role: Role, stream: TcpStream) -> State {
         peer.egress_depth.clone(),
     ));
     peer_send_open(peer);
+    peer.timer.opensent_hold_timer = Some(timer::start_opensent_hold_timer(peer, conn_id));
     State::OpenSent
 }
 
@@ -3027,6 +3068,37 @@ pub fn fsm_holdtimer_expires(peer: &mut Peer) -> State {
     }
     peer_send_notification(peer, NotifyCode::HoldTimerExpired, 0, Vec::new());
     State::Idle
+}
+
+/// RFC 4271 §8.2.2 HoldTimer_Expires in OpenSent, for the conn whose
+/// timer expired: the remote's OPEN never came on it, so it is closed
+/// with Hold Timer Expired. A closed primary leaves the session to a
+/// parked conn (`fall_back_to_collision`), and a closed parked conn
+/// leaves it to the primary (`collision_closed`). With neither left the
+/// peer goes to Idle, which paces the redial. An expiry whose timer was
+/// stopped in the meantime is ignored.
+pub fn fsm_opensent_holdtimer_expires(peer: &mut Peer, conn: ConnTag) -> State {
+    let armed = opensent_hold_timer(peer, conn)
+        .and_then(Option::take)
+        .is_some();
+    if !armed {
+        return peer.state;
+    }
+    match conn {
+        ConnTag::Primary => {
+            close_primary(peer, NotifyCode::HoldTimerExpired, 0);
+            match peer.collision.take() {
+                Some(collision) => fall_back_to_collision(peer, collision),
+                None => State::Idle,
+            }
+        }
+        ConnTag::Collision => {
+            if let Some(collision) = peer.collision.take() {
+                close_collision(collision, NotifyCode::HoldTimerExpired, 0);
+            }
+            collision_closed(peer)
+        }
+    }
 }
 
 /// RFC 4271 §6.3: a fatal UPDATE error (today, an unrecognized
@@ -3067,7 +3139,7 @@ pub fn fsm_keepalive_expires(peer: &mut Peer) -> State {
 /// did for a fast idle-hold-paced redial) made a connect-only peer —
 /// one that never listens, so our dial is refused instantly — spend
 /// essentially the whole retry cycle in Idle, where
-/// `handle_peer_connection` drops every inbound connect before its OPEN
+/// `fsm_accepted` drops every inbound connect before its OPEN
 /// is read; the session could never establish without passive-mode.
 ///
 /// The RFC's ConnectRetryTimer default of 120s (RFC §10) is far too
@@ -3853,6 +3925,7 @@ fn start_collision_conn(peer: &mut Peer, role: Role, stream: TcpStream) {
         local_addr,
         remote_addr,
         open: None,
+        opensent_hold_timer: Some(timer::start_opensent_hold_timer(peer, conn_id)),
     });
     // Mirror peer_send_open but target the collision packet_tx.
     let bytes = build_open_packet(peer);
@@ -3866,7 +3939,73 @@ fn start_collision_conn(peer: &mut Peer, role: Role, stream: TcpStream) {
     let _ = packet_tx.send(bytes);
 }
 
-/// Handle incoming connection for a peer based on current BGP state.
+/// An inbound connection for this peer, handled by the state it finds
+/// the peer in.
+pub fn fsm_accepted(peer: &mut Peer, stream: TcpStream) -> State {
+    // Pin the egress TTL on the freshly accepted socket *before* we
+    // decide its fate. For a `ttl-security` (GTSM) peer this is what
+    // lets a rejected or dropped inbound connection be torn down
+    // cleanly: the NOTIFICATION and the kernel FIN/RST that close the
+    // socket must leave at TTL 255, or the peer's `IP_MINTTL` = 255
+    // floor silently drops them and the peer never learns the
+    // connection is gone — it keeps retransmitting its OPEN into a
+    // black hole and stays wedged in OpenSent until its hold timer
+    // (minutes) expires. This bites whenever two GTSM speakers connect
+    // at once (a collision after a simultaneous restart / clear): the
+    // loser's teardown is invisible to the winner. The keep paths
+    // (`fsm_connected` / `start_collision_conn`) re-apply this together
+    // with the ingress floor, so the early set is harmless redundancy
+    // for them.
+    {
+        use std::os::fd::AsRawFd;
+        let _ = super::ttl::set_egress_ttl(
+            stream.as_raw_fd(),
+            peer.address.is_ipv4(),
+            peer.session_ttl(),
+        );
+    }
+    match peer.state {
+        State::Idle => {
+            // No session established yet - just drop (sends TCP RST/FIN)
+            drop(stream);
+            State::Idle
+        }
+        State::Connect => {
+            // Our own dial stays in flight: the remote may have taken
+            // it already. Cancelling it dropped a connection the
+            // remote was establishing on. When both sides took the
+            // other's dial while dialling, each killed the one the
+            // other had kept, and both redialled after the idle hold.
+            // If it completes, it is parked as the §6.8 collision
+            // conn (`Event::Connected` in OpenSent).
+            fsm_connected(peer, Role::Passive, stream)
+        }
+        State::Active => fsm_connected(peer, Role::Passive, stream),
+        State::OpenSent | State::OpenConfirm => {
+            // RFC 4271 §6.8 collision: we already have a primary
+            // connection in flight. Stash this one as the
+            // collision conn and wait for an OPEN on either side
+            // to decide which survives. If a collision is already
+            // pending, drop the new one — having three TCPs to
+            // the same peer isn't worth modeling.
+            if peer.primary_role == Some(Role::Active) && peer.collision.is_none() {
+                start_collision_conn(peer, Role::Passive, stream);
+            } else {
+                reject_connection(stream, NotifyCode::Cease, 7); // ConnectionCollisionResolution
+            }
+            peer.state
+        }
+        State::Established => {
+            // Session already established. Per RFC 4271 §6.8,
+            // close the new connection with Cease
+            // (ConnectionCollisionResolution).
+            reject_connection(stream, NotifyCode::Cease, 7);
+            State::Established
+        }
+    }
+}
+
+/// The ident of the peer an inbound connection belongs to.
 ///
 /// `scope_id` is the IPv6 scope of the accepted socket — for a
 /// link-local source it is the arrival ifindex, which is how an
@@ -3878,91 +4017,30 @@ fn start_collision_conn(peer: &mut Peer, role: Role, stream: TcpStream) {
 /// address map, so an inbound connection from it would otherwise be
 /// dropped, and the session (both ends connect actively *and* accept
 /// passively) could never resolve a collision into Established.
-pub(super) fn handle_peer_connection(
-    peers: &mut PeerMap,
+pub(super) fn inbound_peer(
+    peers: &PeerMap,
+    peer_addr: IpAddr,
+    scope_id: Option<u32>,
+) -> Option<usize> {
+    peers
+        .get(&peer_addr)
+        .or_else(|| scope_id.and_then(|ifindex| peers.get_by_key(&PeerKey::Interface(ifindex))))
+        .map(|peer| peer.ident)
+}
+
+/// Run an inbound connection through the FSM of the peer it belongs
+/// to, as `Event::Accepted`. Gives the stream back when no peer matches.
+fn dispatch_accept(
+    bgp: &mut Bgp,
     peer_addr: IpAddr,
     scope_id: Option<u32>,
     stream: TcpStream,
 ) -> Option<TcpStream> {
-    let key = if peers.get(&peer_addr).is_some() {
-        PeerKey::Addr(peer_addr)
-    } else if let Some(ifindex) = scope_id
-        && peers.get_by_key(&PeerKey::Interface(ifindex)).is_some()
-    {
-        PeerKey::Interface(ifindex)
-    } else {
+    let Some(ident) = inbound_peer(&bgp.peers, peer_addr, scope_id) else {
         return Some(stream);
     };
-    if let Some(peer) = peers.get_mut_by_key(&key) {
-        // Pin the egress TTL on the freshly accepted socket *before* we
-        // decide its fate. For a `ttl-security` (GTSM) peer this is what
-        // lets a rejected or dropped inbound connection be torn down
-        // cleanly: the NOTIFICATION and the kernel FIN/RST that close the
-        // socket must leave at TTL 255, or the peer's `IP_MINTTL` = 255
-        // floor silently drops them and the peer never learns the
-        // connection is gone — it keeps retransmitting its OPEN into a
-        // black hole and stays wedged in OpenSent until its hold timer
-        // (minutes) expires. This bites whenever two GTSM speakers connect
-        // at once (a collision after a simultaneous restart / clear): the
-        // loser's teardown is invisible to the winner. The keep paths
-        // (`fsm_connected` / `start_collision_conn`) re-apply this together
-        // with the ingress floor, so the early set is harmless redundancy
-        // for them.
-        {
-            use std::os::fd::AsRawFd;
-            let _ = super::ttl::set_egress_ttl(
-                stream.as_raw_fd(),
-                peer.address.is_ipv4(),
-                peer.session_ttl(),
-            );
-        }
-        match peer.state {
-            State::Idle => {
-                // No session established yet - just drop (sends TCP RST/FIN)
-                drop(stream);
-                None
-            }
-            State::Connect => {
-                // Our own dial stays in flight: the remote may have taken
-                // it already. Cancelling it dropped a connection the
-                // remote was establishing on. When both sides took the
-                // other's dial while dialling, each killed the one the
-                // other had kept, and both redialled after the idle hold.
-                // If it completes, it is parked as the §6.8 collision
-                // conn (`Event::Connected` in OpenSent).
-                peer.state = fsm_connected(peer, Role::Passive, stream);
-                None
-            }
-            State::Active => {
-                peer.state = fsm_connected(peer, Role::Passive, stream);
-                None
-            }
-            State::OpenSent | State::OpenConfirm => {
-                // RFC 4271 §6.8 collision: we already have a primary
-                // connection in flight. Stash this one as the
-                // collision conn and wait for an OPEN on either side
-                // to decide which survives. If a collision is already
-                // pending, drop the new one — having three TCPs to
-                // the same peer isn't worth modeling.
-                if peer.primary_role == Some(Role::Active) && peer.collision.is_none() {
-                    start_collision_conn(peer, Role::Passive, stream);
-                    None
-                } else {
-                    reject_connection(stream, NotifyCode::Cease, 7); // ConnectionCollisionResolution
-                    None
-                }
-            }
-            State::Established => {
-                // Session already established. Per RFC 4271 §6.8,
-                // close the new connection with Cease
-                // (ConnectionCollisionResolution).
-                reject_connection(stream, NotifyCode::Cease, 7);
-                None
-            }
-        }
-    } else {
-        Some(stream)
-    }
+    bgp.process_msg(Message::Event(ident, Event::Accepted(stream)));
+    None
 }
 
 pub fn accept(bgp: &mut Bgp, stream: TcpStream, sockaddr: SocketAddr) {
@@ -3979,7 +4057,7 @@ pub fn accept(bgp: &mut Bgp, stream: TcpStream, sockaddr: SocketAddr) {
         SocketAddr::V6(addr) if addr.scope_id() != 0 => Some(addr.scope_id()),
         _ => None,
     };
-    let mut remaining_stream = handle_peer_connection(&mut bgp.peers, peer_addr, scope_id, stream);
+    let mut remaining_stream = dispatch_accept(bgp, peer_addr, scope_id, stream);
 
     // Static lookup missed — try a configured listen-range. If LPM
     // hits and the per-range neighbor-group resolves to a usable
@@ -4069,7 +4147,7 @@ pub(super) fn try_dynamic_accept(
         let _ = super::neighbor_group::apply_inherited(&bgp.neighbor_groups, &bgp.policy_tx, peer);
         // Start the FSM the way a config commit does for a static
         // passive peer: `update_timers` flips a passive Idle peer to
-        // Active, so the re-run of `handle_peer_connection` below
+        // Active, so the `Event::Accepted` dispatched below
         // promotes this very stream instead of dropping it in Idle
         // (where the peer would otherwise be stuck forever — nothing
         // else ever starts a dynamic peer).
@@ -4088,7 +4166,7 @@ pub(super) fn try_dynamic_accept(
 
     // Dynamic (listen-range) peers are always address-keyed, so no
     // interface scope is needed here.
-    let rest = handle_peer_connection(&mut bgp.peers, peer_addr, None, stream);
+    let rest = dispatch_accept(bgp, peer_addr, None, stream);
 
     // Attach BFD the way a config commit does for a static neighbor. A
     // dynamic peer has no `bfd` leaf of its own, so an instance-wide
@@ -4649,11 +4727,13 @@ mod fsm_idle_hold_tests {
             local_addr: None,
             remote_addr: None,
             open: None,
+            opensent_hold_timer: None,
         }
     }
 
     /// Peer in OpenSent with an active-role primary conn and a parked
-    /// collision conn — the §6.8 staging position. Returns the two
+    /// collision conn — the §6.8 staging position. Both conns have sent
+    /// our OPEN, so both run their OpenSent hold timer. Returns the two
     /// conn ids (primary, collision).
     fn peer_with_collision() -> (Peer, ConnId, ConnId) {
         let mut peer = test_peer(false);
@@ -4663,9 +4743,12 @@ mod fsm_idle_hold_tests {
         peer.packet_tx = Some(packet_tx);
         peer.primary_role = Some(Role::Active);
         peer.primary_conn_id = Some(primary_id);
+        peer.timer.opensent_hold_timer = Some(timer::start_opensent_hold_timer(&peer, primary_id));
         peer.state = State::OpenSent;
         let collision_id = peer.alloc_conn_id();
-        peer.collision = Some(test_collision_conn(collision_id));
+        let mut collision = test_collision_conn(collision_id);
+        collision.opensent_hold_timer = Some(timer::start_opensent_hold_timer(&peer, collision_id));
+        peer.collision = Some(collision);
         (peer, primary_id, collision_id)
     }
 
@@ -4913,20 +4996,14 @@ mod fsm_idle_hold_tests {
         peer.state = next;
         timer::update_timers(&mut peer);
 
-        let addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut peers = PeerMap::new();
-        peers.insert(addr, peer);
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
 
-        let leftover = handle_peer_connection(&mut peers, addr, None, stream);
-        assert!(leftover.is_none(), "the inbound stream must be consumed");
-        let peer = peers.get(&addr).unwrap();
+        let (next, _) = fsm_next_state(&mut peer, Event::Accepted(stream));
         assert_eq!(
-            peer.state,
+            next,
             State::OpenSent,
             "the inbound connect must be promoted, not dropped"
         );
@@ -4950,19 +5027,13 @@ mod fsm_idle_hold_tests {
         peer.state = State::Connect;
         peer.task.connect = Some(Task::spawn(async {}));
 
-        let addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut peers = PeerMap::new();
-        peers.insert(addr, peer);
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
 
-        let leftover = handle_peer_connection(&mut peers, addr, None, stream);
-        assert!(leftover.is_none());
-        let peer = peers.get(&addr).unwrap();
-        assert_eq!(peer.state, State::OpenSent);
+        let (next, _) = fsm_next_state(&mut peer, Event::Accepted(stream));
+        assert_eq!(next, State::OpenSent);
         assert!(peer.task.connect.is_some(), "the pending dial goes on");
         assert_eq!(peer.primary_role, Some(Role::Passive));
     }
@@ -5152,22 +5223,18 @@ mod fsm_idle_hold_tests {
         peer.state = fsm_bgp_open(&mut peer, ConnTag::Primary, open());
         assert_eq!(peer.state, State::OpenConfirm);
 
-        let addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut peers = PeerMap::new();
-        peers.insert(addr, peer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
-        assert!(handle_peer_connection(&mut peers, addr, None, stream).is_none());
-        let peer = peers.get_mut(&addr).unwrap();
+        peer.state = fsm_next_state(&mut peer, Event::Accepted(stream)).0;
         assert_eq!(
             peer.collision.as_ref().map(|c| c.role),
             Some(Role::Passive),
             "the late inbound is parked as the collision conn"
         );
 
-        let next = fsm_bgp_open(peer, ConnTag::Collision, open());
+        let next = fsm_bgp_open(&mut peer, ConnTag::Collision, open());
         assert_eq!(
             next,
             State::OpenConfirm,
@@ -5177,7 +5244,7 @@ mod fsm_idle_hold_tests {
         assert_eq!(peer.primary_conn_id, Some(primary_id));
 
         peer.state = next;
-        let (next, _) = fsm_next_state(peer, Event::KeepAliveMsg(primary_id));
+        let (next, _) = fsm_next_state(&mut peer, Event::KeepAliveMsg(primary_id));
         assert_eq!(
             next,
             State::Established,
@@ -5489,6 +5556,433 @@ mod fsm_idle_hold_tests {
         assert_eq!(peer.primary_conn_id, Some(primary_id));
         assert!(peer.collision.is_none(), "no third connection is parked");
     }
+
+    const HOLD_TIMER_EXPIRED: (u8, u8) = (4, 0);
+
+    /// Point the primary conn at a channel the test reads.
+    fn watch_primary(peer: &mut Peer) -> UnboundedReceiver<BytesMut> {
+        let (packet_tx, packet_rx) = mpsc::unbounded_channel::<BytesMut>();
+        peer.packet_tx = Some(packet_tx);
+        packet_rx
+    }
+
+    /// Point the parked conn at a channel the test reads.
+    fn watch_collision(peer: &mut Peer) -> UnboundedReceiver<BytesMut> {
+        let (packet_tx, packet_rx) = mpsc::unbounded_channel::<BytesMut>();
+        peer.collision.as_mut().unwrap().packet_tx = packet_tx;
+        packet_rx
+    }
+
+    /// (code, sub-code) of every NOTIFICATION queued on `rx`.
+    fn notifications(rx: &mut UnboundedReceiver<BytesMut>) -> Vec<(u8, u8)> {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            if bytes[18] == BgpType::Notification as u8 {
+                out.push((bytes[19], bytes[20]));
+            }
+        }
+        out
+    }
+
+    fn keepalives(rx: &mut UnboundedReceiver<BytesMut>) -> usize {
+        let mut count = 0;
+        while let Ok(bytes) = rx.try_recv() {
+            if bytes[18] == BgpType::Keepalive as u8 {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// A BGP instance on parked channels, for the accept path.
+    fn test_bgp() -> Bgp {
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        Box::leak(Box::new(inbound_rx));
+        let (rib_rx_tx, rib_rx) = mpsc::unbounded_channel();
+        Box::leak(Box::new(rib_rx_tx));
+        let client = crate::rib::client::RibClient::new(
+            inbound_tx,
+            crate::rib::client::ProtoId::from_raw(0),
+        );
+        let ctx = crate::context::ProtoContext::default_table(client);
+        let (rib_tx, rib_out_rx) = mpsc::unbounded_channel();
+        let (rib_inbound_tx, sub_inbound_rx) = mpsc::unbounded_channel();
+        Box::leak(Box::new(rib_out_rx));
+        Box::leak(Box::new(sub_inbound_rx));
+        let subscriber = crate::config::RibSubscriber::for_test(
+            rib_tx,
+            rib_inbound_tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        );
+        let (policy_tx, policy_rx) = mpsc::unbounded_channel();
+        Box::leak(Box::new(policy_rx));
+        Bgp::new(
+            ctx,
+            rib_rx,
+            subscriber,
+            policy_tx,
+            None,
+            None,
+            mpsc::channel(1).0,
+        )
+    }
+
+    /// RFC 4271 §8.2.2, HoldTimer_Expires in OpenSent.
+    #[tokio::test]
+    async fn opensent_hold_expiry_on_a_lone_primary_goes_idle_and_redials() {
+        for passive in [false, true] {
+            let (mut peer, primary_id, _collision_id) = peer_with_collision();
+            peer.collision = None;
+            peer.config.transport.passive = passive;
+            let mut wire = watch_primary(&mut peer);
+
+            let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(primary_id));
+            assert_eq!(next, State::Idle, "passive={passive}");
+            assert_eq!(
+                notifications(&mut wire),
+                vec![HOLD_TIMER_EXPIRED],
+                "passive={passive}"
+            );
+
+            // What `fsm()` does after a state change.
+            peer.state = next;
+            timer::update_timers(&mut peer);
+            assert!(peer.packet_tx.is_none());
+            assert!(peer.primary_conn_id.is_none());
+            if passive {
+                assert_eq!(peer.state, State::Active, "a passive peer listens again");
+            } else {
+                assert!(
+                    peer.timer.idle_hold_timer.is_some(),
+                    "the idle hold timer paces the redial"
+                );
+            }
+        }
+    }
+
+    /// Seen in the lab: our dial is the primary, in OpenSent on a
+    /// connection the remote no longer has, so its OPEN never comes. The
+    /// remote's dial is parked, and its OPEN loses §6.8 and is kept. The
+    /// remote waited for our KEEPALIVE on the parked conn until its hold
+    /// timer expired, redialled, and the same happened again, for a day.
+    #[tokio::test]
+    async fn a_silent_primary_leaves_the_session_to_the_waiting_collision() {
+        let open = || open_with_id(Ipv4Addr::new(10, 0, 0, 0));
+        for keepalive_held in [false, true] {
+            let (mut peer, primary_id, collision_id) = peer_with_collision();
+            let mut primary_wire = watch_primary(&mut peer);
+            let mut parked_wire = watch_collision(&mut peer);
+            peer.state = fsm_next_state(&mut peer, Event::BGPOpen(collision_id, open())).0;
+            assert_eq!(peer.state, State::OpenSent, "the losing OPEN is kept");
+            if keepalive_held {
+                peer.state = fsm_next_state(&mut peer, Event::KeepAliveMsg(collision_id)).0;
+            }
+
+            let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(primary_id));
+            assert_eq!(
+                notifications(&mut primary_wire),
+                vec![HOLD_TIMER_EXPIRED],
+                "keepalive_held={keepalive_held}"
+            );
+            assert_eq!(peer.primary_conn_id, Some(collision_id));
+            assert!(peer.collision.is_none());
+            assert_eq!(
+                keepalives(&mut parked_wire),
+                1,
+                "keepalive_held={keepalive_held}: our KEEPALIVE answers the kept OPEN"
+            );
+            if keepalive_held {
+                assert_eq!(next, State::Established);
+            } else {
+                assert_eq!(next, State::OpenConfirm);
+                peer.state = next;
+                let (next, _) = fsm_next_state(&mut peer, Event::KeepAliveMsg(collision_id));
+                assert_eq!(next, State::Established);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_primary_leaves_a_parked_conn_waiting_on_its_own_timer() {
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        let mut primary_wire = watch_primary(&mut peer);
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(primary_id));
+        assert_eq!(next, State::OpenSent);
+        assert_eq!(notifications(&mut primary_wire), vec![HOLD_TIMER_EXPIRED]);
+        assert_eq!(peer.primary_conn_id, Some(collision_id));
+        assert!(peer.collision.is_none());
+        assert!(peer.timer.opensent_hold_timer.is_some());
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+        assert_eq!(next, State::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_silent_parked_winner_is_closed_and_the_held_keepalive_completes() {
+        let open = || open_with_id(Ipv4Addr::new(10, 0, 0, 2));
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        let mut parked_wire = watch_collision(&mut peer);
+        peer.state = fsm_next_state(&mut peer, Event::BGPOpen(primary_id, open())).0;
+        peer.state = fsm_next_state(&mut peer, Event::KeepAliveMsg(primary_id)).0;
+        assert_eq!(peer.state, State::OpenConfirm, "the KEEPALIVE is held");
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+        assert_eq!(next, State::Established);
+        assert!(peer.collision.is_none());
+        assert_eq!(peer.primary_conn_id, Some(primary_id));
+        assert_eq!(notifications(&mut parked_wire), vec![HOLD_TIMER_EXPIRED]);
+    }
+
+    #[tokio::test]
+    async fn a_silent_parked_conn_is_closed_and_the_primary_waits_on() {
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        let mut parked_wire = watch_collision(&mut peer);
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+        assert_eq!(next, State::OpenSent);
+        assert!(peer.collision.is_none());
+        assert_eq!(peer.primary_conn_id, Some(primary_id));
+        assert!(
+            peer.timer.opensent_hold_timer.is_some(),
+            "the primary's own timer runs on"
+        );
+        assert_eq!(notifications(&mut parked_wire), vec![HOLD_TIMER_EXPIRED]);
+    }
+
+    #[tokio::test]
+    async fn an_opensent_hold_expiry_for_a_closed_parked_conn_is_ignored() {
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        peer.state = fsm_next_state(&mut peer, Event::ConnFail(collision_id)).0;
+        let mut wire = watch_primary(&mut peer);
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+        assert_eq!(next, State::OpenSent);
+        assert_eq!(peer.primary_conn_id, Some(primary_id));
+        assert!(notifications(&mut wire).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_opensent_hold_expiry_for_a_replaced_primary_is_ignored() {
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        peer.state = fsm_next_state(&mut peer, Event::ConnFail(primary_id)).0;
+        assert_eq!(peer.primary_conn_id, Some(collision_id));
+        let mut wire = watch_primary(&mut peer);
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(primary_id));
+        assert_eq!(next, State::OpenSent);
+        assert_eq!(peer.primary_conn_id, Some(collision_id));
+        assert!(notifications(&mut wire).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_primarys_open_stops_its_opensent_hold_timer() {
+        let (mut peer, primary_id, _collision_id) = peer_with_collision();
+        peer.collision = None;
+        let open = open_with_id(Ipv4Addr::new(10, 0, 0, 2));
+        peer.state = fsm_next_state(&mut peer, Event::BGPOpen(primary_id, open)).0;
+        assert_eq!(peer.state, State::OpenConfirm);
+        assert!(peer.timer.opensent_hold_timer.is_none());
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(primary_id));
+        assert_eq!(next, State::OpenConfirm, "a late expiry is ignored");
+    }
+
+    #[tokio::test]
+    async fn a_kept_open_stops_the_parked_conns_opensent_hold_timer() {
+        let (mut peer, primary_id, collision_id) = peer_with_collision();
+        let open = open_with_id(Ipv4Addr::new(10, 0, 0, 0));
+        peer.state = fsm_next_state(&mut peer, Event::BGPOpen(collision_id, open)).0;
+        let parked = peer.collision.as_ref().unwrap();
+        assert!(parked.opensent_hold_timer.is_none());
+        assert!(
+            peer.timer.opensent_hold_timer.is_some(),
+            "the primary still waits for its OPEN"
+        );
+
+        let (next, _) = fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+        assert_eq!(next, State::OpenSent);
+        assert!(peer.collision.is_some(), "a late expiry is ignored");
+        assert_eq!(peer.primary_conn_id, Some(primary_id));
+    }
+
+    /// The winner's OPEN resolves §6.8 from OpenConfirm, so no state
+    /// change follows that could clear the promoted conn's timer.
+    #[tokio::test]
+    async fn a_parked_winners_open_stops_its_opensent_hold_timer() {
+        let open = || open_with_id(Ipv4Addr::new(10, 0, 0, 2));
+        let (mut peer, _primary_id, collision_id) = peer_with_collision();
+        peer.state = fsm_bgp_open(&mut peer, ConnTag::Primary, open());
+        peer.state = fsm_bgp_open(&mut peer, ConnTag::Collision, open());
+        assert_eq!(peer.state, State::OpenConfirm);
+        assert_eq!(peer.primary_conn_id, Some(collision_id));
+        assert!(peer.timer.opensent_hold_timer.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_conn_promoted_before_its_open_keeps_its_opensent_hold_timer() {
+        let cease = || NotificationPacket::new(NotifyCode::Cease, 7, Vec::new());
+        for from in [State::OpenSent, State::OpenConfirm] {
+            let (mut peer, primary_id, collision_id) = peer_with_collision();
+            if from == State::OpenConfirm {
+                let open = open_with_id(Ipv4Addr::new(10, 0, 0, 2));
+                peer.state = fsm_bgp_open(&mut peer, ConnTag::Primary, open);
+            }
+            let (next, _) = fsm_next_state(&mut peer, Event::NotifMsg(primary_id, cease()));
+            assert_eq!(next, State::OpenSent, "from {from:?}");
+            // What `fsm()` does after a state change.
+            peer.state = next;
+            timer::update_timers(&mut peer);
+            assert_eq!(peer.primary_conn_id, Some(collision_id));
+
+            let mut wire = watch_primary(&mut peer);
+            let (next, _) =
+                fsm_next_state(&mut peer, Event::OpenSentHoldTimerExpires(collision_id));
+            assert_eq!(next, State::Idle, "from {from:?}");
+            assert_eq!(notifications(&mut wire), vec![HOLD_TIMER_EXPIRED]);
+        }
+    }
+
+    #[tokio::test]
+    async fn our_open_on_the_primary_starts_its_opensent_hold_timer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = test_peer(false);
+        peer.state = State::Connect;
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        peer.state = fsm_next_state(&mut peer, Event::Connected(stream)).0;
+        assert_eq!(peer.state, State::OpenSent);
+        assert!(peer.timer.opensent_hold_timer.is_some());
+    }
+
+    #[tokio::test]
+    async fn our_open_on_a_parked_conn_starts_its_opensent_hold_timer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = test_peer(false);
+        let primary_id = peer.alloc_conn_id();
+        let (packet_tx, packet_rx) = mpsc::unbounded_channel::<BytesMut>();
+        Box::leak(Box::new(packet_rx));
+        peer.packet_tx = Some(packet_tx);
+        peer.primary_role = Some(Role::Passive);
+        peer.primary_conn_id = Some(primary_id);
+        peer.state = State::OpenSent;
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        peer.state = fsm_next_state(&mut peer, Event::Connected(stream)).0;
+        let parked = peer.collision.as_ref().expect("our dial is parked");
+        assert!(parked.opensent_hold_timer.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_opensent_hold_timer_fires_on_the_normal_lane_with_its_conn() {
+        let (tx, mut rx) = mpsc::channel::<Message>(64);
+        let (ptx, mut prx) = mpsc::channel::<Message>(64);
+        let mut peer = Peer::new(
+            1,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            65002,
+            "10.0.0.2".parse().unwrap(),
+            None,
+            tx,
+            crate::context::ProtoContext::default_table_no_rib(),
+        );
+        peer.ptx = ptx;
+        let start = tokio::time::Instant::now();
+        let _timer = timer::start_opensent_hold_timer(&peer, 7);
+
+        let msg = rx.recv().await;
+        assert!(matches!(
+            msg,
+            Some(Message::Event(1, Event::OpenSentHoldTimerExpires(7)))
+        ));
+        assert!(start.elapsed() >= std::time::Duration::from_secs(timer::OPENSENT_HOLD_TIME));
+        assert!(prx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn opensent_hold_timer_lifecycle_across_states() {
+        for state in [
+            State::Idle,
+            State::Connect,
+            State::Active,
+            State::OpenSent,
+            State::OpenConfirm,
+            State::Established,
+        ] {
+            let mut peer = test_peer(false);
+            peer.timer.opensent_hold_timer = Some(timer::start_opensent_hold_timer(&peer, 1));
+            peer.state = state;
+            timer::update_timers(&mut peer);
+            assert_eq!(
+                peer.timer.opensent_hold_timer.is_some(),
+                state == State::OpenSent,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// RFC 4271 §8.2.2, Connect and Active: a TCP connection that comes
+    /// up stops the ConnectRetryTimer and sets the HoldTimer to a large
+    /// value. Left running, the connect-retry fire dialed again beside
+    /// the accepted conn.
+    #[tokio::test]
+    async fn an_accept_stops_connect_retry_and_starts_the_opensent_hold_timer() {
+        for state in [State::Connect, State::Active] {
+            let mut bgp = test_bgp();
+            let addr: IpAddr = "10.0.0.2".parse().unwrap();
+            let peer = Peer::new(
+                0,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                65002,
+                addr,
+                None,
+                bgp.tx.clone(),
+                bgp.ctx.clone(),
+            );
+            bgp.peers.insert(addr, peer);
+            let peer = bgp.peers.get_mut(&addr).unwrap();
+            peer.first_start = false;
+            peer.state = state;
+            peer.timer.connect_retry = Some(timer::start_connect_retry_timer(peer));
+            if state == State::Connect {
+                peer.task.connect = Some(Task::spawn(async {}));
+            }
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let _remote = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            accept(&mut bgp, stream, SocketAddr::new(addr, 40000));
+
+            let peer = bgp.peers.get(&addr).unwrap();
+            assert_eq!(peer.state, State::OpenSent, "{state:?}");
+            assert_eq!(peer.primary_role, Some(Role::Passive), "{state:?}");
+            assert!(peer.timer.connect_retry.is_none(), "{state:?}");
+            assert!(peer.timer.opensent_hold_timer.is_some(), "{state:?}");
+        }
+    }
+
+    /// RFC 4271 §8.2.2 ignores a start event once a connection is up. A
+    /// Start queued just before that (a connect-retry or idle hold fire,
+    /// a connected-route or link-up kick) must not dial beside it.
+    #[tokio::test]
+    async fn a_late_start_does_not_dial_beside_a_live_connection() {
+        for state in [State::OpenSent, State::OpenConfirm, State::Established] {
+            let (mut peer, primary_id, _collision_id) = peer_with_collision();
+            peer.collision = None;
+            peer.state = state;
+            let (next, _) = fsm_next_state(&mut peer, Event::Start);
+            assert_eq!(next, state);
+            assert!(peer.task.connect.is_none(), "{state:?}: no second dial");
+            assert!(peer.timer.connect_retry.is_none(), "{state:?}");
+            assert_eq!(peer.primary_conn_id, Some(primary_id));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5791,6 +6285,7 @@ mod bad_bgp_identifier_tests {
             local_addr: None,
             remote_addr: None,
             open: None,
+            opensent_hold_timer: None,
         });
 
         let next = fsm_bgp_open(
@@ -6309,40 +6804,34 @@ mod dynamic_accept_tests {
         assert!(peer.timer.connect_retry.is_none());
     }
 
-    /// With the peer started (Active), the re-run of
-    /// `handle_peer_connection` must promote the very stream that
-    /// materialized the peer into a session (OpenSent), not return it
-    /// to the caller for dropping.
+    /// With the peer started (Active), the `Event::Accepted` that
+    /// `try_dynamic_accept` dispatches must promote the very stream that
+    /// materialized the peer into a session (OpenSent).
     #[tokio::test]
     async fn active_dynamic_peer_promotes_inbound_stream() {
         let addr: IpAddr = "127.0.0.1".parse().unwrap();
         let mut peer = dynamic_peer(addr);
         peer.start();
-        let mut peers = PeerMap::new();
-        peers.insert(addr, peer);
 
         let (server, _client) = tcp_pair().await;
-        let remaining = handle_peer_connection(&mut peers, addr, None, server);
+        let (next, _) = fsm_next_state(&mut peer, Event::Accepted(server));
 
-        assert!(remaining.is_none(), "the stream must be consumed");
-        assert_eq!(peers.get(&addr).unwrap().state, State::OpenSent);
+        assert_eq!(next, State::OpenSent);
     }
 
-    /// The Idle branch of `handle_peer_connection` consumes and drops
-    /// the stream — which is why an unstarted dynamic peer could never
-    /// establish: the fix is to not be in Idle, not to change this
-    /// RFC 4271 behavior.
+    /// The Idle branch of `fsm_accepted` drops the stream — which is
+    /// why an unstarted dynamic peer could never establish: the fix is
+    /// to not be in Idle, not to change this RFC 4271 behavior.
     #[tokio::test]
     async fn idle_dynamic_peer_drops_inbound_stream() {
         let addr: IpAddr = "127.0.0.1".parse().unwrap();
-        let mut peers = PeerMap::new();
-        peers.insert(addr, dynamic_peer(addr));
+        let mut peer = dynamic_peer(addr);
 
         let (server, _client) = tcp_pair().await;
-        let remaining = handle_peer_connection(&mut peers, addr, None, server);
+        let (next, _) = fsm_next_state(&mut peer, Event::Accepted(server));
 
-        assert!(remaining.is_none());
-        assert_eq!(peers.get(&addr).unwrap().state, State::Idle);
+        assert_eq!(next, State::Idle);
+        assert!(peer.packet_tx.is_none());
     }
 }
 

@@ -18,7 +18,7 @@ value, so every peer past the first armed its timer under ident 0
 and its `Event::Start` was delivered to the *first* peer instead.
 
 The wedged peer stays in Idle, which blocks the session from both
-directions: it never dials, and `handle_peer_connection` drops
+directions: it never dials, and `fsm_accepted` drops
 inbound streams for an Idle peer, so the CE's own dial is refused
 too. Before the fix CE2 below never leaves Idle.
 

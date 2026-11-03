@@ -3851,6 +3851,10 @@ struct Neighbor<'a> {
     keepalive_timer_rem: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hold_timer_rem: Option<u64>,
+    /// Remaining seconds on the primary conn's OpenSent hold timer,
+    /// which runs while its OPEN from the remote has yet to arrive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opensent_hold_timer_rem: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     idle_hold_timer_rem: Option<u64>,
     idle_hold_timer_next: u64,
@@ -4165,6 +4169,7 @@ fn fetch(peer: &Peer) -> Neighbor<'_> {
     // Get remaining time for keepalive and hold timers
     let keepalive_timer_rem = peer.timer.keepalive.as_ref().map(|t| t.rem_sec());
     let hold_timer_rem = peer.timer.hold_timer.as_ref().map(|t| t.rem_sec());
+    let opensent_hold_timer_rem = peer.timer.opensent_hold_timer.as_ref().map(|t| t.rem_sec());
     let idle_hold_timer_rem = peer.timer.idle_hold_timer.as_ref().map(|t| t.rem_sec());
     // "Next idle hold timer value" — if a timer is currently running,
     // report the value it was started with (its full duration);
@@ -4214,6 +4219,7 @@ fn fetch(peer: &Peer) -> Neighbor<'_> {
         timer_recv: peer.param_rx.clone(),
         keepalive_timer_rem,
         hold_timer_rem,
+        opensent_hold_timer_rem,
         idle_hold_timer_rem,
         idle_hold_timer_next,
         connect_retry_timer_rem,
@@ -4413,6 +4419,13 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
     }
     if let Some(hold_rem) = neighbor.hold_timer_rem {
         writeln!(out, "  Next hold timer expires in {} seconds", hold_rem)?;
+    }
+    if let Some(opensent_hold_rem) = neighbor.opensent_hold_timer_rem {
+        writeln!(
+            out,
+            "  Next OpenSent hold timer expires in {} seconds",
+            opensent_hold_rem
+        )?;
     }
     writeln!(
         out,
@@ -7190,6 +7203,33 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         );
     }
 
+    #[tokio::test]
+    async fn opensent_hold_timer_line_rendered_only_while_it_runs() {
+        use super::super::timer::{OPENSENT_HOLD_TIME, start_opensent_hold_timer};
+
+        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 9).into());
+        let mut out = String::new();
+        render(&mut out, &fetch(&peer)).unwrap();
+        assert!(
+            !out.contains("OpenSent hold timer"),
+            "no timer, no line:\n{out}"
+        );
+
+        peer.timer.opensent_hold_timer = Some(start_opensent_hold_timer(&peer, 1));
+        let mut out = String::new();
+        render(&mut out, &fetch(&peer)).unwrap();
+        let rem: u64 = out
+            .lines()
+            .find_map(|line| line.strip_prefix("  Next OpenSent hold timer expires in "))
+            .and_then(|rest| rest.strip_suffix(" seconds"))
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or_else(|| panic!("OpenSent hold timer line missing:\n{out}"));
+        assert!(
+            (OPENSENT_HOLD_TIME - 5..=OPENSENT_HOLD_TIME).contains(&rem),
+            "{rem}"
+        );
+    }
+
     /// `neighbor X description <text>` renders FRR-style directly
     /// under the header line; a peer without one gets no line.
     #[test]
@@ -7356,6 +7396,7 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
             timer_recv: PeerParam::default(),
             keepalive_timer_rem: None,
             hold_timer_rem: None,
+            opensent_hold_timer_rem: None,
             idle_hold_timer_rem: None,
             idle_hold_timer_next: 0,
             connect_retry_timer_rem: None,

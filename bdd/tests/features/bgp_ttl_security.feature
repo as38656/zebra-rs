@@ -65,7 +65,7 @@ Feature: BGP TTL Security / GTSM (RFC 5082)
     # re-run + re-advertise, no session bounce) and would leave the
     # stale pre-GTSM connection up. A clean GTSM reconnect reaches
     # Established in ~6s once collision-teardown packets carry TTL 255
-    # (peer.rs handle_peer_connection); 15s is margin for CI.
+    # (peer.rs fsm_accepted); 15s is margin for CI.
     And I run "clear bgp ipv4 neighbor 192.168.0.2" in namespace "z1"
     And I run "clear bgp ipv4 neighbor 192.168.0.1" in namespace "z2"
     And I wait 15 seconds for BGP to operate

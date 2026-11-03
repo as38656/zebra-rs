@@ -6,7 +6,7 @@ use rand::RngExt;
 use crate::config::{Args, ConfigOp};
 use crate::context::Timer;
 
-use super::peer::{Event, Peer, PeerType, State};
+use super::peer::{ConnId, Event, Peer, PeerType, State};
 use super::{Bgp, Message};
 
 #[derive(Debug, Default, Clone)]
@@ -183,6 +183,23 @@ pub fn start_dial_retry_timer(peer: &Peer) -> Timer {
     start_timer!(peer, tx, peer.config.timer.idle_hold_time(), Event::Start)
 }
 
+/// RFC 4271 §8.2.2: in OpenSent the HoldTimer is set to a large value;
+/// the RFC suggests 4 minutes.
+pub const OPENSENT_HOLD_TIME: u64 = 240;
+
+/// The OpenSent hold timer of connection `conn`, started when our OPEN
+/// goes out on it.
+pub fn start_opensent_hold_timer(peer: &Peer, conn: ConnId) -> Timer {
+    // The normal lane, so the expiry cannot overtake an OPEN that this
+    // conn's reader has already queued.
+    start_timer!(
+        peer,
+        tx,
+        OPENSENT_HOLD_TIME,
+        Event::OpenSentHoldTimerExpires(conn)
+    )
+}
+
 fn start_hold_timer(peer: &Peer) -> Timer {
     start_timer!(
         peer,
@@ -300,6 +317,7 @@ pub fn update_timers(peer: &mut Peer) {
             }
             peer.timer.connect_retry = None;
             peer.timer.hold_timer = None;
+            peer.timer.opensent_hold_timer = None;
             peer.timer.keepalive = None;
 
             // Idle is quiescent: abort any in-flight dial so it can't
@@ -337,6 +355,7 @@ pub fn update_timers(peer: &mut Peer) {
             // replaces the stuck dial and restarts the timer.
             peer.timer.idle_hold_timer = None;
             peer.timer.hold_timer = None;
+            peer.timer.opensent_hold_timer = None;
             peer.timer.keepalive = None;
         }
         Active => {
@@ -346,6 +365,7 @@ pub fn update_timers(peer: &mut Peer) {
             // peer parked by the connected-check holdoff.
             peer.timer.idle_hold_timer = None;
             peer.timer.hold_timer = None;
+            peer.timer.opensent_hold_timer = None;
             peer.timer.keepalive = None;
         }
         OpenSent => {
@@ -365,6 +385,7 @@ pub fn update_timers(peer: &mut Peer) {
             // so we keep refreshing the session.
             peer.timer.idle_hold_timer = None;
             peer.timer.connect_retry = None;
+            peer.timer.opensent_hold_timer = None;
             if peer.timer.hold_timer.is_none() && peer.param.hold_time > 0 {
                 peer.timer.hold_timer = Some(start_hold_timer(peer));
             }
