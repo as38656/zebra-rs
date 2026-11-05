@@ -1,0 +1,98 @@
+module zebra-bgp-ebgp-requires-policy {
+  yang-version "1";
+
+  namespace "urn:ietf:params:xml:ns:yang:zebra-bgp-ebgp-requires-policy";
+  prefix "zberp";
+
+  import ietf-bgp {
+    prefix bgp;
+  }
+
+  import config {
+    prefix config;
+  }
+
+  import configure {
+    prefix configure;
+  }
+
+  import extension {
+    prefix ext;
+  }
+
+  organization
+    "zebra-rs";
+
+  contact
+    "https://github.com/zebra-rs";
+
+  description
+    "RFC 8212 behaviour for external BGP sessions.
+
+     With the knob on, an address family of an eBGP session that has no
+     route-policy and no prefix-set bound in a direction exchanges no
+     route in that direction:
+
+       router bgp {
+         ebgp-requires-policy true;
+         vrf red {
+           ebgp-requires-policy true;
+         }
+       }
+
+     RFC 8212 asks for on as the default. The default here is off in
+     `router bgp` and in each `router bgp vrf`, so existing configs keep
+     working. It is the same knob as FRR `bgp ebgp-requires-policy`.";
+
+  revision 2026-11-04 {
+    description "Initial revision: ebgp-requires-policy per BGP instance.";
+    reference
+      "RFC 8212: Default External BGP (EBGP) Route Propagation Behavior
+       without Policies.";
+  }
+
+  grouping bgp-ebgp-requires-policy {
+    description
+      "RFC 8212 toggle of one BGP instance.";
+
+    leaf ebgp-requires-policy {
+      ext:help "Exchange no route with an eBGP neighbor without policy (RFC 8212)";
+      type boolean;
+      default "false";
+      description
+        "When true, an address family of an eBGP neighbor
+         accepts no route when no inbound route-policy or prefix-set is
+         bound to it, and advertises no route when no outbound one is
+         bound. The session stays up. `show bgp summary` shows such a
+         neighbor as `(Policy)`.
+
+         When false (default), routes pass without policy. RFC 8212
+         asks for true as the default; the default here is false so
+         existing configs keep working.
+
+         iBGP neighbors are not affected. A change is applied at the
+         end of the commit without resetting any session: the routes
+         are evaluated again the same way as after a policy change
+         (from the stored Adj-RIB-In with soft-reconfiguration
+         inbound, else with a ROUTE-REFRESH).";
+    }
+  }
+
+  /* =========================================================
+   * Augments into the zebra-rs configure tree
+   * ========================================================= */
+
+  augment "/configure:set/config:router/bgp:bgp" {
+    description
+      "Attach ebgp-requires-policy to the BGP top-level in the
+       candidate-set subtree.";
+    uses bgp-ebgp-requires-policy;
+  }
+
+  augment "/configure:delete/config:router/bgp:bgp" {
+    description
+      "Same attachment for the delete subtree so
+       `delete router bgp ebgp-requires-policy` is path-valid.";
+    uses bgp-ebgp-requires-policy;
+  }
+}

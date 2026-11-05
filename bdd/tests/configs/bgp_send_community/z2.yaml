@@ -1,0 +1,42 @@
+# z2 (AS 65002) takes the route from z1. Its inbound policy deletes
+# communities by pattern: every standard community with value 2 and every
+# large community whose last field is 9.
+community-set:
+- name: ANY-VALUE-2
+  members:
+  - "*:2"
+large-community-set:
+- name: ANY-LOCAL2-9
+  members:
+  - "*:*:9"
+policy:
+- name: CLEAN
+  entry:
+  - number: 10
+    action: permit
+    set:
+      community:
+        name: ANY-VALUE-2
+        delete: ~
+      large-community:
+        name: ANY-LOCAL2-9
+        delete: ~
+interface:
+- if-name: z1
+  ipv4:
+    address: 192.168.0.2/24
+router:
+  bgp:
+    global:
+      as: 65002
+      router-id: 192.168.0.2
+    neighbor:
+    - remote-address: 192.168.0.1
+      remote-as: 65001
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+        policy:
+          in: CLEAN

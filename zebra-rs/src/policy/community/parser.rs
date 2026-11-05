@@ -70,6 +70,16 @@
 // }
 // ```
 //
+// Standard community pattern match (`*` is any value of a whole field):
+// ```
+// community-set FROM-64500 {
+//   member {
+//     64500:*;             // Every community of AS 64500
+//     *:1001;              // Every community with value 1001
+//   };
+// }
+// ```
+//
 // # Implementation Details
 //
 // - Extended communities support both exact and regex pattern matching
@@ -140,6 +150,92 @@ impl Ord for CompiledRegex {
 pub enum StandardMatcher {
     Exact(CommunityValue),
     Regex(CompiledRegex),
+    /// `ASN:VALUE` with `*` for any field, such as `64500:*`.
+    Wildcard(CommunityPattern),
+}
+
+/// A standard community pattern: each field is a value or `None` for
+/// `*`. It compares whole fields, unlike a regex over the text form.
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+pub struct CommunityPattern {
+    pub asn: Option<u16>,
+    pub value: Option<u16>,
+}
+
+/// One field of a community pattern: a value, or `*` for any.
+pub(crate) fn fmt_pattern_field<T: std::fmt::Display>(field: &Option<T>) -> String {
+    match field {
+        Some(value) => value.to_string(),
+        None => "*".to_string(),
+    }
+}
+
+impl std::fmt::Display for CommunityPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            fmt_pattern_field(&self.asn),
+            fmt_pattern_field(&self.value)
+        )
+    }
+}
+
+/// The fields of a community pattern such as `64500:*`: `count` fields
+/// split by `:`, each `*` or a decimal number, at least one `*`. `None`
+/// when `input` has another shape. A field is `None` for `*`.
+pub(crate) fn pattern_fields(input: &str, count: usize) -> Option<Vec<Option<&str>>> {
+    let fields: Vec<&str> = input.split(':').collect();
+    let is_number = |f: &str| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit());
+    let shaped = fields.len() == count
+        && fields.iter().all(|f| *f == "*" || is_number(f))
+        && fields.contains(&"*");
+    shaped.then(|| {
+        fields
+            .into_iter()
+            .map(|f| (f != "*").then_some(f))
+            .collect()
+    })
+}
+
+/// One field of a pattern: `None` for `*`, else a value that must fit `T`.
+pub(crate) fn parse_pattern_field<T: FromStr>(field: Option<&str>) -> Result<Option<T>, ()> {
+    field.map(|f| f.parse::<T>().map_err(|_| ())).transpose()
+}
+
+/// Whether a pattern field accepts `value`.
+pub(crate) fn pattern_field_matches<T: PartialEq>(field: Option<T>, value: T) -> bool {
+    field.is_none_or(|f| f == value)
+}
+
+impl FromStr for CommunityPattern {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let fields = pattern_fields(input, 2).ok_or(())?;
+        Ok(Self {
+            asn: parse_pattern_field(fields[0])?,
+            value: parse_pattern_field(fields[1])?,
+        })
+    }
+}
+
+impl CommunityPattern {
+    pub fn matches(&self, value: u32) -> bool {
+        pattern_field_matches(self.asn, (value >> 16) as u16)
+            && pattern_field_matches(self.value, value as u16)
+    }
+}
+
+impl StandardMatcher {
+    /// Whether the community `value` is a member.
+    pub fn matches(&self, value: u32) -> bool {
+        match self {
+            StandardMatcher::Exact(target) => target.0 == value,
+            StandardMatcher::Regex(compiled) => compiled.is_match(&CommunityValue(value).to_str()),
+            StandardMatcher::Wildcard(pattern) => pattern.matches(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -199,6 +295,13 @@ impl FromStr for CommunityMatcher {
             )));
         }
 
+        if pattern_fields(input, 2).is_some() {
+            let pattern = input.parse()?;
+            return Ok(CommunityMatcher::Standard(StandardMatcher::Wildcard(
+                pattern,
+            )));
+        }
+
         // Check if input looks like a regex pattern (contains special regex chars)
         let has_regex_chars = input.contains('^')
             || input.contains('$')
@@ -240,23 +343,10 @@ pub fn match_community_set(matcher: &CommunityMatcher, bgp_attr: &BgpAttr) -> bo
             let Some(ref community) = bgp_attr.com else {
                 return false;
             };
-
-            match standard_matcher {
-                StandardMatcher::Exact(target_value) => {
-                    // Check if the community list contains the exact value
-                    community.contains(&target_value.0)
-                }
-                StandardMatcher::Regex(compiled) => {
-                    // Convert all communities to strings and check against pre-compiled regex
-                    for &com_val in &community.0 {
-                        let com_str = CommunityValue(com_val).to_str();
-                        if compiled.is_match(&com_str) {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            }
+            community
+                .0
+                .iter()
+                .any(|value| standard_matcher.matches(*value))
         }
         CommunityMatcher::Extended(extended_matcher) => {
             // Check extended community attribute
@@ -573,5 +663,78 @@ mod tests {
         // Test that invalid regex pattern fails at parse time
         let result = CommunityMatcher::from_str("rt:[invalid(regex");
         assert!(result.is_err());
+    }
+
+    fn standard(input: &str) -> StandardMatcher {
+        match CommunityMatcher::from_str(input) {
+            Ok(CommunityMatcher::Standard(m)) => m,
+            other => panic!("{input}: expected a standard matcher, got {other:?}"),
+        }
+    }
+
+    fn com(value: &str) -> u32 {
+        CommunityValue::from_readable_str(value).unwrap().0
+    }
+
+    #[test]
+    fn a_star_field_parses_as_a_wildcard() {
+        assert_eq!(
+            standard("64500:*"),
+            StandardMatcher::Wildcard(CommunityPattern {
+                asn: Some(64500),
+                value: None,
+            })
+        );
+        assert_eq!(
+            standard("*:1001"),
+            StandardMatcher::Wildcard(CommunityPattern {
+                asn: None,
+                value: Some(1001),
+            })
+        );
+        assert_eq!(
+            standard("*:*"),
+            StandardMatcher::Wildcard(CommunityPattern {
+                asn: None,
+                value: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_wildcard_with_a_field_out_of_range_is_rejected() {
+        assert!(CommunityMatcher::from_str("65536:*").is_err());
+        assert!(CommunityMatcher::from_str("*:65536").is_err());
+    }
+
+    #[test]
+    fn a_wildcard_compares_whole_fields() {
+        let m = standard("64500:*");
+        assert!(m.matches(com("64500:1")));
+        assert!(m.matches(com("64500:65535")));
+        assert!(!m.matches(com("1:64500")), "not a substring match");
+        assert!(!m.matches(com("645:1")));
+
+        let m = standard("*:1001");
+        assert!(m.matches(com("65000:1001")));
+        assert!(!m.matches(com("1001:1")));
+    }
+
+    #[test]
+    fn exact_and_regex_members_match_values_as_before() {
+        assert!(standard("100:200").matches(com("100:200")));
+        assert!(!standard("100:200").matches(com("100:201")));
+        assert!(standard("^100:.*$").matches(com("100:7")));
+        assert!(!standard("^100:.*$").matches(com("1000:7")));
+    }
+
+    #[test]
+    fn a_community_set_wildcard_matches_a_route() {
+        let mut bgp_attr = BgpAttr::new();
+        bgp_attr.com = Some(Community::from([com("65000:1001")]));
+        let matcher = CommunityMatcher::from_str("*:1001").unwrap();
+        assert!(match_community_set(&matcher, &bgp_attr));
+        let matcher = CommunityMatcher::from_str("64500:*").unwrap();
+        assert!(!match_community_set(&matcher, &bgp_attr));
     }
 }

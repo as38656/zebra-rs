@@ -61,7 +61,43 @@ impl fmt::Display for ExtIpv6CommunityValue {
     }
 }
 
+/// Path attribute Type Code of the IPv6 Address Specific Extended
+/// Community (RFC 5701). It has no `AttrType`, so it travels as an
+/// unrecognized optional transitive attribute.
+pub const IPV6_EXT_COMMUNITY_TYPE_CODE: u8 = 25;
+
+/// Octets in one IPv6 Address Specific Extended Community (RFC 5701 §2).
+const IPV6_EXT_COMMUNITY_LEN: usize = 20;
+
+/// The raw value of an IPv6 Address Specific Extended Community
+/// attribute without its Route Target entries. `None` when no entry is
+/// left, or when the value is not a whole number of entries and so cannot
+/// be checked entry by entry.
+pub fn ipv6_ext_community_without_route_targets(value: &[u8]) -> Option<Vec<u8>> {
+    let (entries, rest) = value.as_chunks::<IPV6_EXT_COMMUNITY_LEN>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let kept: Vec<u8> = entries
+        .iter()
+        .filter(|entry| !is_route_target_type(entry[0], entry[1]))
+        .flatten()
+        .copied()
+        .collect();
+    (!kept.is_empty()).then_some(kept)
+}
+
+fn is_route_target_type(high_type: u8, low_type: u8) -> bool {
+    high_type == 0x00 && low_type == RouteTarget as u8
+}
+
 impl ExtIpv6CommunityValue {
+    /// True iff this entry is a Route Target: the transitive type with
+    /// the Route Target sub-type (RFC 5701 §3).
+    pub fn is_route_target(&self) -> bool {
+        is_route_target_type(self.high_type, self.low_type)
+    }
+
     pub fn new(addr: Ipv6Addr, val: u16) -> Self {
         let mut com = Self {
             high_type: 0x00,

@@ -5,7 +5,7 @@ use nom::bytes::complete::take;
 use nom::number::complete::be_u8;
 use nom_derive::*;
 
-use crate::{BgpAttr, BgpNexthop, BgpParseError, ParseBe, ParseOption};
+use crate::{Afi, AfiSafi, BgpAttr, BgpNexthop, BgpParseError, ParseBe, ParseOption, Safi};
 
 use super::*;
 
@@ -409,25 +409,32 @@ fn attr_malformation_is_discard(attr_type: AttrType) -> bool {
     matches!(attr_type, AttrType::As4Path | AttrType::As4Aggregator)
 }
 
-type ParsedAttributes<'a> = Result<
-    (
-        &'a [u8],
-        Option<BgpAttr>,
-        Option<MpReachAttr>,
-        Option<MpUnreachAttr>,
-        // RFC 7606 treat-as-withdraw: set when a recoverable attribute
-        // (e.g. a malformed BGP Prefix-SID) was discarded, so the caller
-        // withdraws the UPDATE's reachable NLRI instead of installing.
-        bool,
-    ),
-    BgpParseError,
->;
+/// What the path-attribute block of one UPDATE parsed into.
+#[derive(Debug, Default)]
+pub struct UpdateAttributes {
+    pub bgp_attr: Option<BgpAttr>,
+    pub mp_update: Option<MpReachAttr>,
+    pub mp_withdraw: Option<MpUnreachAttr>,
+    /// RFC 7606 treat-as-withdraw: set when a recoverable attribute
+    /// (e.g. a malformed BGP Prefix-SID) was discarded, so the caller
+    /// withdraws the UPDATE's reachable NLRI instead of installing.
+    pub treat_as_withdraw: bool,
+    /// RFC 8669 §4: the BGP Prefix-SID came from an external peer for a
+    /// family that does not accept it, and was dropped unparsed.
+    pub prefix_sid_discarded: bool,
+}
 
+type ParsedAttributes<'a> = Result<(&'a [u8], UpdateAttributes), BgpParseError>;
+
+/// Parse the path-attribute block of an UPDATE. `ipv4_nlri` tells
+/// whether the UPDATE also carries IPv4 unicast NLRI in its NLRI field,
+/// which follows the block on the wire.
 pub fn parse_bgp_update_attribute(
     input: &[u8],
     length: u16,
     as4: bool,
     opt: Option<ParseOption>,
+    ipv4_nlri: bool,
 ) -> ParsedAttributes<'_> {
     let length = length as usize;
     let (input, attr) = packet_utils::safe_split_at(input, length).map_err(BgpParseError::from)?;
@@ -436,10 +443,17 @@ pub fn parse_bgp_update_attribute(
     let mut mp_update: Option<MpReachAttr> = None;
     let mut mp_withdraw: Option<MpUnreachAttr> = None;
     let mut treat_as_withdraw = false;
+    let mut prefix_sid_discarded = false;
     // RFC 6793 transitional attributes, parked until every attribute is
     // in (wire order is arbitrary) and reconciled after the loop.
     let mut as4_path: Option<As4Path> = None;
     let mut as4_aggregator: Option<Aggregator> = None;
+    // A Prefix-SID from an external peer waits unparsed for MP_REACH,
+    // which names the family it applies to and may come later.
+    let external_prefix_sid = opt
+        .as_ref()
+        .is_some_and(|o| o.is_ebgp() && !o.prefix_sid_discard.is_empty());
+    let mut parked_prefix_sid: Option<&[u8]> = None;
 
     while !remaining.is_empty() {
         // Parse the framing first so a Value-parse error stays recoverable:
@@ -490,6 +504,11 @@ pub fn parse_bgp_update_attribute(
             AttrType::LocalPref | AttrType::OriginatorId | AttrType::ClusterList
         ) && opt.as_ref().is_some_and(|o| o.is_ebgp())
         {
+            remaining = new_remaining;
+            continue;
+        }
+        if attr_type == AttrType::PrefixSid && external_prefix_sid {
+            parked_prefix_sid = Some(attr_payload);
             remaining = new_remaining;
             continue;
         }
@@ -654,6 +673,26 @@ pub fn parse_bgp_update_attribute(
         remaining = new_remaining;
     }
 
+    if let Some(payload) = parked_prefix_sid {
+        // RFC 8669 §4: discarded unless every family the attribute would
+        // reach accepts it, so that a malformed one costs nothing.
+        let discard = opt.as_ref().map(|o| &o.prefix_sid_discard);
+        let mut reach = mp_update
+            .as_ref()
+            .map(MpReachAttr::afi_safi)
+            .into_iter()
+            .chain(ipv4_nlri.then(|| AfiSafi::new(Afi::Ip, Safi::Unicast)));
+        if reach.any(|family| discard.is_some_and(|d| d.contains(&family))) {
+            prefix_sid_discarded = true;
+        } else {
+            match Attr::parse_attr_value(AttrType::PrefixSid, payload, as4, &opt) {
+                Ok(Attr::PrefixSid(v)) => bgp_attr.prefix_sid = Some(v),
+                // RFC 9252 §7: a malformed Prefix-SID is treat-as-withdraw.
+                _ => treat_as_withdraw = true,
+            }
+        }
+    }
+
     // RFC 6793 §4.2.3 reconciliation. Only an OLD (non-AS4) session
     // carries information in AS4_PATH / AS4_AGGREGATOR; on an AS4
     // session the AS_PATH is already 4-octet and a stray AS4_PATH from
@@ -679,21 +718,24 @@ pub fn parse_bgp_update_attribute(
 
     Ok((
         input,
-        Some(bgp_attr),
-        mp_update,
-        mp_withdraw,
-        treat_as_withdraw,
+        UpdateAttributes {
+            bgp_attr: Some(bgp_attr),
+            mp_update,
+            mp_withdraw,
+            treat_as_withdraw,
+            prefix_sid_discarded,
+        },
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bgp_update_attribute;
+    use super::{UpdateAttributes, parse_bgp_update_attribute};
     use crate::BgpParseError;
 
     #[test]
     fn parse_bgp_update_attribute_rejects_oversized_length() {
-        let err = parse_bgp_update_attribute(&[0xff, 0xee, 0xdd], 4, false, None)
+        let err = parse_bgp_update_attribute(&[0xff, 0xee, 0xdd], 4, false, None, false)
             .expect_err("oversized attribute block length must fail");
         match err {
             BgpParseError::IncompleteData { needed } => assert_eq!(needed, 4),
@@ -719,8 +761,17 @@ mod tests {
         block.extend_from_slice(&psid_value);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, mp_update, mp_withdraw, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must not reset session");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                mp_update,
+                mp_withdraw,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false)
+            .expect("must not reset session");
         assert!(
             treat_as_withdraw,
             "malformed Prefix-SID must treat-as-withdraw"
@@ -757,9 +808,15 @@ mod tests {
         pmsi.extend_from_slice(&[0x00, 0x3E, 0x80]);
         pmsi.extend_from_slice(&[0x0A; 12]);
         let block = origin_and_pmsi(&pmsi);
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, block.len() as u16, false, None)
-                .expect("must not reset session");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, block.len() as u16, false, None, false)
+            .expect("must not reset session");
         assert!(treat_as_withdraw, "composite PMSI must treat-as-withdraw");
         let bgp_attr = bgp_attr.expect("attrs parsed");
         assert!(bgp_attr.origin.is_some(), "ORIGIN survives");
@@ -772,18 +829,30 @@ mod tests {
     fn unparsable_pmsi_tunnel_identifier_is_treat_as_withdraw() {
         let pmsi = [0x00, 0x06, 0x00, 0x00, 0x64, 10, 0, 0, 1, 0, 0, 0];
         let block = origin_and_pmsi(&pmsi);
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, block.len() as u16, false, None)
-                .expect("must not reset session");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, block.len() as u16, false, None, false)
+            .expect("must not reset session");
         assert!(treat_as_withdraw);
         assert!(bgp_attr.expect("attrs parsed").pmsi_tunnel.is_none());
 
         // The control: the same attribute with a 4-octet identifier is kept.
         let pmsi = [0x00, 0x06, 0x00, 0x00, 0x64, 10, 0, 0, 1];
         let block = origin_and_pmsi(&pmsi);
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, block.len() as u16, false, None)
-                .expect("well-formed");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, block.len() as u16, false, None, false)
+            .expect("well-formed");
         assert!(!treat_as_withdraw);
         let pmsi = bgp_attr.expect("attrs parsed").pmsi_tunnel.expect("kept");
         assert!(pmsi.is_ingress_replication());
@@ -815,8 +884,15 @@ mod tests {
         block.extend_from_slice(&attr);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, mp_update, _mp_withdraw, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("attrs must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                mp_update,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("attrs must parse");
         assert!(!treat_as_withdraw);
         assert!(bgp_attr.is_some());
         match mp_update {
@@ -852,8 +928,15 @@ mod tests {
         block.extend_from_slice(&value);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, mp_update, _mp_withdraw, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("attrs must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                mp_update,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("attrs must parse");
         assert!(!treat_as_withdraw);
         let bgp_attr = bgp_attr.expect("attrs parsed");
         assert!(
@@ -892,9 +975,15 @@ mod tests {
             block.extend_from_slice(&value);
             let len = block.len() as u16;
 
-            let (_, bgp_attr, _, _, treat_as_withdraw) =
-                parse_bgp_update_attribute(&block, len, true, None)
-                    .expect("must not reset the session");
+            let (
+                _,
+                UpdateAttributes {
+                    bgp_attr,
+                    treat_as_withdraw,
+                    ..
+                },
+            ) = parse_bgp_update_attribute(&block, len, true, None, false)
+                .expect("must not reset the session");
             assert!(
                 treat_as_withdraw,
                 "COMMUNITIES length {} must be treat-as-withdraw",
@@ -919,9 +1008,15 @@ mod tests {
             block.extend(std::iter::repeat_n(0u8, n));
             let len = block.len() as u16;
 
-            let (_, bgp_attr, _, _, treat_as_withdraw) =
-                parse_bgp_update_attribute(&block, len, true, None)
-                    .expect("must not reset the session");
+            let (
+                _,
+                UpdateAttributes {
+                    bgp_attr,
+                    treat_as_withdraw,
+                    ..
+                },
+            ) = parse_bgp_update_attribute(&block, len, true, None, false)
+                .expect("must not reset the session");
             assert!(
                 treat_as_withdraw,
                 "LARGE_COMMUNITY length {n} must be treat-as-withdraw"
@@ -937,8 +1032,14 @@ mod tests {
         let mut block = ORIGIN_IGP.to_vec();
         block.extend_from_slice(&[0xC0, 8, 8, 0x00, 0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0x01]);
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, true, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, true, None, false).expect("must parse");
         assert!(!treat_as_withdraw);
         let com = bgp_attr
             .expect("bgp_attr")
@@ -971,9 +1072,15 @@ mod tests {
         block.extend_from_slice(&v);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, true, None)
-                .expect("an IPv6 ext-community must not reset the session");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, true, None, false)
+            .expect("an IPv6 ext-community must not reset the session");
         assert!(!treat_as_withdraw);
 
         let bgp_attr = bgp_attr.expect("bgp_attr present");
@@ -1003,8 +1110,14 @@ mod tests {
         block.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x02, 0xfd, 0xe8, 0xfd, 0xe9]);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("attrs must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("attrs must parse");
         assert!(!treat_as_withdraw);
 
         let aspath = bgp_attr
@@ -1045,8 +1158,14 @@ mod tests {
         block.extend_from_slice(&[0xC0, 17, 0x06, 0x02, 0x01, 0x00, 0x01, 0x11, 0x70]);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, taw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("must parse");
         assert!(!taw);
         let aspath = bgp_attr.expect("attrs").aspath.expect("aspath present");
         assert_eq!(flat_asns(&aspath), vec![65001, 70000]);
@@ -1064,8 +1183,8 @@ mod tests {
         block.extend_from_slice(&[0xC0, 17, 0x06, 0x02, 0x01, 0x00, 0x01, 0x11, 0x70]);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, _) =
-            parse_bgp_update_attribute(&block, len, true, None).expect("must parse");
+        let (_, UpdateAttributes { bgp_attr, .. }) =
+            parse_bgp_update_attribute(&block, len, true, None, false).expect("must parse");
         let aspath = bgp_attr.expect("attrs").aspath.expect("aspath present");
         assert_eq!(flat_asns(&aspath), vec![65001]);
     }
@@ -1085,8 +1204,8 @@ mod tests {
         block.extend_from_slice(&v);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, _) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must parse");
+        let (_, UpdateAttributes { bgp_attr, .. }) =
+            parse_bgp_update_attribute(&block, len, false, None, false).expect("must parse");
         let agg = bgp_attr.expect("attrs").aggregator.expect("widened");
         assert_eq!(agg.asn, 4200000000);
         assert_eq!(agg.ip, std::net::Ipv4Addr::new(10, 0, 0, 1));
@@ -1110,8 +1229,8 @@ mod tests {
         block.extend_from_slice(&v);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, _) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must parse");
+        let (_, UpdateAttributes { bgp_attr, .. }) =
+            parse_bgp_update_attribute(&block, len, false, None, false).expect("must parse");
         let bgp_attr = bgp_attr.expect("attrs");
         let agg = bgp_attr.aggregator.expect("aggregator");
         assert_eq!(agg.asn, 65001, "AGGREGATOR wins over stale AS4_AGGREGATOR");
@@ -1133,8 +1252,14 @@ mod tests {
         block.extend_from_slice(&[0xC0, 17, 0x03, 0x02, 0x02, 0x00]);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, taw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must not reset");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("must not reset");
         assert!(!taw, "attribute discard, not treat-as-withdraw");
         let aspath = bgp_attr.expect("attrs").aspath.expect("aspath survives");
         assert_eq!(flat_asns(&aspath), vec![65001, u32::from(AS_TRANS)]);
@@ -1150,8 +1275,14 @@ mod tests {
         block.extend_from_slice(&[0x40, 0x02, 0x03, 0x02, 0x02, 0xfd]);
 
         let len = block.len() as u16;
-        let (_, bgp_attr, _, _, taw) =
-            parse_bgp_update_attribute(&block, len, true, None).expect("must not reset");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, true, None, false).expect("must not reset");
         assert!(taw, "malformed AS_PATH must treat-as-withdraw");
         assert!(bgp_attr.expect("attrs").aspath.is_none());
     }
@@ -1177,8 +1308,14 @@ mod tests {
         assert_eq!(&buf[7..13], &[0x02, 0x02, 0x5b, 0xa0, 0xfd, 0xe9]);
 
         let len = buf.len() as u16;
-        let (_, parsed, _, _, taw) =
-            parse_bgp_update_attribute(&buf, len, false, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr: parsed,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&buf, len, false, None, false).expect("must parse");
         assert!(!taw);
         let parsed = parsed.expect("attrs");
         let aspath = parsed.aspath.expect("aspath");
@@ -1199,8 +1336,12 @@ mod tests {
         attr.attr_emit_opt(&mut buf, true);
         // No type-17 attribute anywhere in the block.
         let len = buf.len() as u16;
-        let (_, parsed, _, _, _) =
-            parse_bgp_update_attribute(&buf, len, true, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr: parsed, ..
+            },
+        ) = parse_bgp_update_attribute(&buf, len, true, None, false).expect("must parse");
         let aspath = parsed.expect("attrs").aspath.expect("aspath");
         assert_eq!(flat_asns(&aspath), vec![70000, 65001]);
     }
@@ -1224,8 +1365,14 @@ mod tests {
         block.extend_from_slice(&[0xC0, 0xFA, 0x02, 0xDE, 0xAD]);
         let len = block.len() as u16;
 
-        let (_, bgp_attr, _mp_u, _mp_w, taw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("must parse");
         assert!(!taw, "unknown transitive must not treat-as-withdraw");
         let bgp_attr = bgp_attr.expect("attrs parsed");
         assert!(bgp_attr.origin.is_some(), "ORIGIN must survive");
@@ -1253,8 +1400,14 @@ mod tests {
         block.extend_from_slice(&[0x80, 0xFB, 0x01, 0x07]);
         let len = block.len() as u16;
 
-        let (_, bgp_attr, _mp_u, _mp_w, taw) =
-            parse_bgp_update_attribute(&block, len, false, None).expect("must parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw: taw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&block, len, false, None, false).expect("must parse");
         assert!(!taw);
         let bgp_attr = bgp_attr.expect("attrs parsed");
         assert!(bgp_attr.origin.is_some(), "ORIGIN must survive");
@@ -1273,7 +1426,7 @@ mod tests {
         block.extend_from_slice(&[0x40, 0xFC, 0x01, 0x09]);
         let len = block.len() as u16;
 
-        let err = parse_bgp_update_attribute(&block, len, false, None)
+        let err = parse_bgp_update_attribute(&block, len, false, None, false)
             .expect_err("unrecognized well-known attribute must error");
         match err {
             BgpParseError::UnrecognizedWellknownAttribute { type_code, attr } => {
@@ -1302,8 +1455,12 @@ mod tests {
         let mut buf = BytesMut::new();
         attr.attr_emit(&mut buf);
         let len = buf.len() as u16;
-        let (_, parsed, _, _, _) =
-            parse_bgp_update_attribute(&buf, len, true, None).expect("re-parse");
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr: parsed, ..
+            },
+        ) = parse_bgp_update_attribute(&buf, len, true, None, false).expect("re-parse");
         let parsed = parsed.unwrap();
         assert_eq!(parsed.unknown.len(), 1);
         assert_eq!(parsed.unknown[0].type_code, 240);
@@ -1333,8 +1490,14 @@ mod otc_tests {
     #[test]
     fn otc_decodes_into_bgp_attr_and_round_trips() {
         let attrs = attr_block(&[0x00, 0x01, 0x00, 0x04]); // AS 65540
-        let (_, bgp_attr, _, _, treat_as_withdraw) =
-            parse_bgp_update_attribute(&attrs, attrs.len() as u16, true, None).unwrap();
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr,
+                treat_as_withdraw,
+                ..
+            },
+        ) = parse_bgp_update_attribute(&attrs, attrs.len() as u16, true, None, false).unwrap();
         assert!(!treat_as_withdraw);
         let bgp_attr = bgp_attr.expect("attributes");
         assert_eq!(bgp_attr.otc, Some(Otc::new(65540)));
@@ -1344,8 +1507,12 @@ mod otc_tests {
 
         let mut buf = BytesMut::new();
         bgp_attr.attr_emit(&mut buf);
-        let (_, again, _, _, _) =
-            parse_bgp_update_attribute(&buf, buf.len() as u16, true, None).unwrap();
+        let (
+            _,
+            UpdateAttributes {
+                bgp_attr: again, ..
+            },
+        ) = parse_bgp_update_attribute(&buf, buf.len() as u16, true, None, false).unwrap();
         assert_eq!(again.unwrap().otc, Some(Otc::new(65540)));
         // Emitted with Optional+Transitive and no Partial bit.
         let pos = buf
@@ -1365,9 +1532,15 @@ mod otc_tests {
             &[0x00u8, 0x01, 0x00, 0x04, 0x00][..],
         ] {
             let attrs = attr_block(bad);
-            let (_, bgp_attr, _, _, treat_as_withdraw) =
-                parse_bgp_update_attribute(&attrs, attrs.len() as u16, true, None)
-                    .expect("malformed OTC must not reset the session");
+            let (
+                _,
+                UpdateAttributes {
+                    bgp_attr,
+                    treat_as_withdraw,
+                    ..
+                },
+            ) = parse_bgp_update_attribute(&attrs, attrs.len() as u16, true, None, false)
+                .expect("malformed OTC must not reset the session");
             assert!(treat_as_withdraw, "len {}", bad.len());
             let bgp_attr = bgp_attr.expect("attributes");
             assert_eq!(bgp_attr.otc, None);

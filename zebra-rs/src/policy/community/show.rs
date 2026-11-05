@@ -71,6 +71,7 @@ fn format_community_matcher(matcher: &CommunityMatcher) -> String {
         CommunityMatcher::Standard(standard) => match standard {
             StandardMatcher::Exact(val) => val.to_str(),
             StandardMatcher::Regex(compiled) => compiled.pattern().to_string(),
+            StandardMatcher::Wildcard(pattern) => pattern.to_string(),
         },
         CommunityMatcher::Extended(extended) => match extended {
             ExtendedMatcher::Exact(val) => val.to_string(),

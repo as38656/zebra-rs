@@ -1,0 +1,54 @@
+# z1 (AS 65001) advertises 10.0.0.1/32 to z2. Its outbound policy stamps
+# one value of each community kind plus the values z2 deletes by pattern.
+community-set:
+- name: C-SET
+  members:
+  - "65001:1"
+  - "65001:2"
+ext-community-set:
+- name: EC-SET
+  members:
+  - "soo:65001:7"
+large-community-set:
+- name: LC-SET
+  members:
+  - "65001:1:1"
+  - "65001:1:9"
+policy:
+- name: STAMP
+  entry:
+  - number: 10
+    action: permit
+    set:
+      community:
+        name: C-SET
+      ext-community:
+        name: EC-SET
+      large-community:
+        name: LC-SET
+interface:
+- if-name: z2
+  ipv4:
+    address: 192.168.0.1/24
+router:
+  bgp:
+    global:
+      as: 65001
+      router-id: 192.168.0.1
+    timer:
+      adv-interval:
+        ebgp: 1
+    neighbor:
+    - remote-address: 192.168.0.2
+      remote-as: 65002
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+        policy:
+          out: STAMP
+    afi-safi:
+    - name: ipv4
+      network:
+      - prefix: 10.0.0.1/32

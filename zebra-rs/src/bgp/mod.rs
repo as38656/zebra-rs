@@ -5,6 +5,7 @@ pub mod constant;
 pub use constant::*;
 
 pub mod afi_knob;
+pub mod attr_filter;
 pub mod auth;
 pub mod config;
 pub mod connected;

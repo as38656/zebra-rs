@@ -24,6 +24,10 @@ module zebra-bgp-vrf {
     prefix zbak;
   }
 
+  import zebra-bgp-ebgp-requires-policy {
+    prefix zberp;
+  }
+
   import config {
     prefix config;
   }
@@ -1012,6 +1016,7 @@ module zebra-bgp-vrf {
            the import fan-out and by eBGP AS-path. Default false leaves an
            ordinary intra-AS L3VPN VRF unchanged.";
       }
+      uses zberp:bgp-ebgp-requires-policy;
       container evpn {
         ext:help "EVPN Type-5 (IP Prefix) service for this VRF";
         description

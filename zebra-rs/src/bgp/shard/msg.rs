@@ -145,7 +145,13 @@ pub enum ShardMsg {
     /// on the synchronous shard.
     /// `from_client`: the peer's current reflector-client role, re-stamped
     /// on every replayed row (see `BgpRib::from_client`).
-    SoftInV4 { ident: usize, from_client: bool },
+    /// `unbound_policy`: what the replay does with a row when the peer has
+    /// no inbound policy bound (RFC 8212).
+    SoftInV4 {
+        ident: usize,
+        from_client: bool,
+        unbound_policy: crate::bgp::policy::UnboundPolicy,
+    },
 
     /// Render a sharded Loc-RIB table for a `show` command — the
     /// scatter-gather half of the show split. The reply travels on the
@@ -277,6 +283,10 @@ pub struct ShardUpdateV4 {
     /// ingest; `false` on the synchronous (N=1) path, where main already
     /// computed `decision`.
     pub compute_policy: bool,
+    /// What `compute_policy` does when the peer has no inbound policy
+    /// bound (RFC 8212). Main decides it from the peer with the rest of
+    /// the peer checks.
+    pub unbound_policy: crate::bgp::policy::UnboundPolicy,
 }
 
 /// Payload of [`ShardMsg::RouteBatchV4`]: the IPv4-unicast NLRIs from one
@@ -296,6 +306,8 @@ pub struct ShardRouteBatchV4 {
     pub stale: bool,
     pub nexthop_reachable: bool,
     pub compute_policy: bool,
+    /// See [`ShardUpdateV4::unbound_policy`].
+    pub unbound_policy: crate::bgp::policy::UnboundPolicy,
 }
 
 /// Payload of [`ShardMsg::UpdateV6`]. Mirrors [`ShardUpdateV4`]: `attr`
@@ -481,6 +493,7 @@ mod tests {
                 tag: 0,
             }),
             compute_policy: false,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         });
         match msg {
             ShardMsg::UpdateV4(u) => {

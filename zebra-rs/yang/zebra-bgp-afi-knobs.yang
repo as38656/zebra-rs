@@ -216,6 +216,74 @@ module zebra-bgp-afi-knobs {
       }
     }
 
+    container prefix-sid {
+      ext:sort "60";
+      ext:help "BGP Prefix-SID across an AS boundary (RFC 8669)";
+      description
+        "Whether the BGP Prefix-SID attribute (RFC 8669, and the SRv6
+         service SIDs of RFC 9252) crosses this session when it is
+         external. The SID belongs to the provider's SR domain, so both
+         directions are closed unless opened here (RFC 8669 sections 4
+         and 5.1, RFC 9252 section 9.2).
+
+         Only the plain unicast families (ipv4, ipv6) use it. VPN
+         families keep the attribute: their SIDs are the service the
+         session exists for. iBGP sessions are not affected.
+
+         `encapsulation-type srv6` or `srv6-relax` on ipv6 already says
+         that the session carries an SRv6 service, so it opens both
+         directions for ipv6 as well.";
+      leaf send {
+        ext:help "Send the Prefix-SID to this external neighbor";
+        type boolean;
+        default "false";
+        description
+          "Send the Prefix-SID on routes of this family. A change is
+           sent to the neighbor at the end of the commit.";
+      }
+      leaf accept {
+        ext:help "Keep the Prefix-SID received from this external neighbor";
+        type boolean;
+        default "false";
+        description
+          "Keep the Prefix-SID on routes of this family received from
+           the neighbor. When false the attribute is removed as the
+           UPDATE is parsed and the route is kept. The value is read
+           when the session starts, so a change applies to the next
+           session (use `clear bgp` to apply it now).";
+      }
+    }
+
+    container send-community {
+      ext:sort "70";
+      ext:help "Community attributes sent to this neighbor";
+      description
+        "Which community attributes are sent on routes of this family
+         (FRR `neighbor X send-community`). Each kind is sent unless it
+         is turned off. The rule runs after the outbound policy, so a
+         policy cannot add back a kind that is turned off. A change is
+         sent to the neighbor at the end of the commit.";
+      leaf standard {
+        ext:help "Send COMMUNITIES (RFC 1997)";
+        type boolean;
+        default "true";
+      }
+      leaf extended {
+        ext:help "Send EXT_COMMUNITIES (RFC 4360, RFC 5701)";
+        type boolean;
+        default "true";
+        description
+          "Send the extended communities, the IPv6 Address Specific
+           ones included. Turning this off also removes the Route
+           Targets of VPN routes.";
+      }
+      leaf large {
+        ext:help "Send LARGE_COMMUNITY (RFC 8092)";
+        type boolean;
+        default "true";
+      }
+    }
+
     container long-lived-graceful-restart {
       ext:help "Per-family long-lived GR settings (RFC 9494)";
       description

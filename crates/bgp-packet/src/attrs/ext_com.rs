@@ -71,6 +71,14 @@ impl ExtCommunityValue {
         buf.put(&self.val[..]);
     }
 
+    /// True iff this entry is a Route Target (RFC 4360 §4, RFC 5668 §3):
+    /// the Route Target sub-type under the transitive two-octet-AS,
+    /// IPv4-address or four-octet-AS type.
+    pub fn is_route_target(&self) -> bool {
+        matches!(self.high_type, 0x00..=0x02)
+            && self.low_type == ExtCommunitySubType::RouteTarget as u8
+    }
+
     /// True iff this entry encodes a Color extended community
     /// (RFC 9012 §4.3): Transitive Opaque (0x03) + Color sub-type
     /// (0x0b).

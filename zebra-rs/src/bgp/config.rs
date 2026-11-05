@@ -99,6 +99,38 @@ fn config_as_sets_withdraw(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Optio
     Some(())
 }
 
+/// `set router bgp ebgp-requires-policy <true|false>` (RFC 8212,
+/// zebra-bgp-ebgp-requires-policy.yang). Delete restores the default.
+fn config_ebgp_requires_policy(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
+    bgp.ebgp_requires_policy = if op.is_set() {
+        super::policy::EbgpRequiresPolicy(args.boolean()?)
+    } else {
+        super::policy::EbgpRequiresPolicy::default()
+    };
+    sync_ebgp_requires_policy(bgp);
+    Some(())
+}
+
+/// Copy the instance `ebgp-requires-policy` onto every peer. An
+/// Established peer whose verdict changed re-runs its inbound policy now
+/// and re-syncs its outbound side at `CommitEnd`; no session is reset.
+pub(super) fn sync_ebgp_requires_policy(bgp: &mut Bgp) {
+    let value = bgp.ebgp_requires_policy;
+    let mut changed = Vec::new();
+    for (_, peer) in bgp.peers.iter_mut_all() {
+        let before = peer.unbound_policy();
+        peer.ebgp_requires_policy = value;
+        if peer.unbound_policy() != before && peer.state.is_established() {
+            changed.push(peer.ident);
+        }
+    }
+    for ident in changed {
+        bgp.shard_replace_in_policy(ident);
+        super::peer::apply_soft_in_peer(bgp, ident);
+        bgp.regroup_resync.insert(ident);
+    }
+}
+
 /// `set router bgp lua-script <name> source-path <path>` — load a named
 /// Lua script from a file into the global script registry. With the `lua`
 /// build feature off the registry is still populated (so a config
@@ -370,6 +402,7 @@ fn config_peer(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
         // from the GR callbacks) would leave this peer advertising no
         // GR capability — and warm reboot flushing its routes.
         peer.config.gr_global = bgp.gr_global_resolved();
+        peer.ebgp_requires_policy = bgp.ebgp_requires_policy;
         bgp.peers.insert(addr, peer);
         // Seed `shared_network` from interface addresses learned so far so
         // the eBGP connected check is accurate on this peer's first dial
@@ -4183,6 +4216,76 @@ fn config_next_hop_unchanged(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Opt
     Some(())
 }
 
+/// `set/delete router bgp neighbor <addr> afi-safi <name> prefix-sid send
+/// <bool>` (RFC 8669 §5.1). An eBGP peer whose egress changed re-syncs at
+/// `CommitEnd`.
+fn config_prefix_sid_send(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let peer = bgp.peers.get_mut(&addr)?;
+    let before = peer.prefix_sid_send(afi_safi.afi);
+    super::afi_knob::set_prefix_sid_send(&mut peer.config, afi_safi, op, &mut args)?;
+    if peer.prefix_sid_send(afi_safi.afi) != before {
+        queue_egress_resync(bgp, addr);
+    }
+    Some(())
+}
+
+/// `set/delete router bgp neighbor <addr> afi-safi <name> prefix-sid accept
+/// <bool>` (RFC 8669 §4). The reader of a session reads it when the
+/// session starts, so nothing is done to a live one.
+fn config_prefix_sid_accept(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let peer = bgp.peers.get_mut(&addr)?;
+    super::afi_knob::set_prefix_sid_accept(&mut peer.config, afi_safi, op, &mut args)
+}
+
+type AfiKnobSetter = fn(&mut super::peer::PeerConfig, AfiSafi, ConfigOp, &mut Args) -> Option<()>;
+
+/// `set/delete router bgp neighbor <addr> afi-safi <name> send-community
+/// <kind> <bool>`, with `setter` for the kind. The peer re-syncs at
+/// `CommitEnd` when the value changed; for the tracked families the
+/// update-group signature moves it as well.
+fn config_send_community(
+    bgp: &mut Bgp,
+    mut args: Args,
+    op: ConfigOp,
+    setter: AfiKnobSetter,
+) -> Option<()> {
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let peer = bgp.peers.get_mut(&addr)?;
+    let before = peer.send_community(afi_safi);
+    setter(&mut peer.config, afi_safi, op, &mut args)?;
+    if peer.send_community(afi_safi) != before {
+        queue_egress_resync(bgp, addr);
+    }
+    Some(())
+}
+
+fn config_send_community_standard(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_send_community(bgp, args, op, super::afi_knob::set_send_community_standard)
+}
+
+fn config_send_community_extended(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_send_community(bgp, args, op, super::afi_knob::set_send_community_extended)
+}
+
+fn config_send_community_large(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_send_community(bgp, args, op, super::afi_knob::set_send_community_large)
+}
+
+/// Queue an Established peer for the outbound re-sync at `CommitEnd`, for
+/// a knob that changes what every family of it sends.
+fn queue_egress_resync(bgp: &mut Bgp, addr: IpAddr) {
+    if let Some(peer) = bgp.peers.get(&addr)
+        && peer.state.is_established()
+    {
+        bgp.regroup_resync.insert(peer.ident);
+    }
+}
+
 fn config_llgr(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
     let addr = args.addr()?;
     let afi_safi: AfiSafi = args.afi_safi()?;
@@ -5272,6 +5375,10 @@ impl Bgp {
             config_global_fast_external_failover,
         );
         self.callback_add("/router/bgp/as-sets-withdraw", config_as_sets_withdraw);
+        self.callback_add(
+            "/router/bgp/ebgp-requires-policy",
+            config_ebgp_requires_policy,
+        );
         // `router bgp port <0-65535>` (zebra-bgp-transport.yang): the
         // listener port; 0 disables listening.
         self.callback_add("/router/bgp/port", config_global_port);
@@ -5563,6 +5670,10 @@ impl Bgp {
             super::vrf_config::config_vrf_inter_as_hybrid,
         );
         self.callback_add(
+            "/router/bgp/vrf/ebgp-requires-policy",
+            super::vrf_config::config_vrf_ebgp_requires_policy,
+        );
+        self.callback_add(
             "/router/bgp/vrf/neighbor",
             super::vrf_config::config_vrf_neighbor,
         );
@@ -5736,6 +5847,26 @@ impl Bgp {
         self.callback_add(
             "/router/bgp/vrf/neighbor/afi-safi/next-hop-self",
             super::vrf_config::config_vrf_neighbor_afi_safi_next_hop_self,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/prefix-sid/send",
+            super::vrf_config::config_vrf_neighbor_afi_safi_prefix_sid_send,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/prefix-sid/accept",
+            super::vrf_config::config_vrf_neighbor_afi_safi_prefix_sid_accept,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/send-community/standard",
+            super::vrf_config::config_vrf_neighbor_afi_safi_send_community_standard,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/send-community/extended",
+            super::vrf_config::config_vrf_neighbor_afi_safi_send_community_extended,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/send-community/large",
+            super::vrf_config::config_vrf_neighbor_afi_safi_send_community_large,
         );
         self.callback_add(
             "/router/bgp/vrf/neighbor/afi-safi/policy/in",
@@ -5975,6 +6106,20 @@ impl Bgp {
         self.callback_peer("/afi-safi/encapsulation-type", config_encapsulation_type);
         self.callback_peer("/afi-safi/next-hop-self", config_next_hop_self);
         self.callback_peer("/afi-safi/next-hop-unchanged", config_next_hop_unchanged);
+        self.callback_peer("/afi-safi/prefix-sid/send", config_prefix_sid_send);
+        self.callback_peer("/afi-safi/prefix-sid/accept", config_prefix_sid_accept);
+        self.callback_peer(
+            "/afi-safi/send-community/standard",
+            config_send_community_standard,
+        );
+        self.callback_peer(
+            "/afi-safi/send-community/extended",
+            config_send_community_extended,
+        );
+        self.callback_peer(
+            "/afi-safi/send-community/large",
+            config_send_community_large,
+        );
         self.callback_peer("/afi-safi/graceful-restart/enabled", config_restart);
         self.callback_peer("/afi-safi/long-lived-graceful-restart/enabled", config_llgr);
         self.callback_peer(
@@ -7625,6 +7770,163 @@ mod neighbor_group_wiring_tests {
             bgp.as_sets_withdraw,
             "delete must restore the default (true)",
         );
+    }
+
+    /// An Established eBGP neighbor at [`peer_addr`] with IPv4 unicast up
+    /// and soft-reconfiguration inbound, holding one received route in
+    /// its Adj-RIB-In. Returns its ident and the route's prefix.
+    fn established_ebgp_with_route(bgp: &mut Bgp) -> (usize, ipnet::Ipv4Net) {
+        use crate::bgp::peer::State;
+        use crate::bgp::route::{BgpRib, BgpRibType};
+        config_peer(bgp, arg_words(&["10.0.0.1"]), ConfigOp::Set).unwrap();
+        config_remote_as(bgp, arg_words(&["10.0.0.1", "65002"]), ConfigOp::Set).unwrap();
+        let _ = drain_stop_events(bgp);
+        let peer = bgp.peers.get_mut(&peer_addr()).unwrap();
+        assert!(peer.is_ebgp());
+        peer.state = State::Established;
+        peer.config.soft_reconfig_in = true;
+        let key = CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast);
+        let entry = peer.cap_map.entries.get_mut(&key).expect("pre-seeded");
+        entry.send = true;
+        entry.recv = true;
+        let ident = peer.ident;
+        let prefix: ipnet::Ipv4Net = "10.9.0.0/24".parse().unwrap();
+        let attr = BgpAttr {
+            nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(10, 0, 0, 1))),
+            ..Default::default()
+        };
+        let rib = BgpRib::new(
+            ident,
+            Ipv4Addr::new(10, 0, 0, 1),
+            BgpRibType::EBGP,
+            0,
+            0,
+            &attr,
+            None,
+            None,
+            false,
+        );
+        bgp.shard.adj_in_mut(ident).add(None, prefix, rib);
+        (ident, prefix)
+    }
+
+    /// `ebgp-requires-policy` (RFC 8212) is an instance boolean, off by
+    /// default. A change reaches every peer, re-runs the inbound policy of
+    /// an Established eBGP peer at once, queues its outbound re-sync for
+    /// `CommitEnd`, and resets no session.
+    #[tokio::test]
+    async fn ebgp_requires_policy_toggle_reevaluates_without_reset() {
+        use crate::bgp::policy::EbgpRequiresPolicy;
+        let mut bgp = fresh_bgp();
+        assert_eq!(bgp.ebgp_requires_policy, EbgpRequiresPolicy(false));
+        let (ident, prefix) = established_ebgp_with_route(&mut bgp);
+        assert_eq!(
+            bgp.peers.get(&peer_addr()).unwrap().ebgp_requires_policy,
+            EbgpRequiresPolicy(false),
+            "a new peer takes the instance value"
+        );
+
+        config_ebgp_requires_policy(&mut bgp, arg_words(&["true"]), ConfigOp::Set).unwrap();
+        let peer = bgp.peers.get(&peer_addr()).unwrap();
+        assert_eq!(peer.ebgp_requires_policy, EbgpRequiresPolicy(true));
+        assert!(
+            bgp.shard.v4.candidates(prefix).is_empty(),
+            "no policy, so the route stays out of the Loc-RIB"
+        );
+        assert!(
+            bgp.regroup_resync.contains(&ident),
+            "outbound re-sync queued"
+        );
+
+        config_ebgp_requires_policy(&mut bgp, arg_words(&["false"]), ConfigOp::Set).unwrap();
+        assert!(
+            !bgp.shard.v4.candidates(prefix).is_empty(),
+            "the received route is replayed into the Loc-RIB"
+        );
+
+        config_ebgp_requires_policy(&mut bgp, arg_words(&["true"]), ConfigOp::Set).unwrap();
+        assert!(
+            bgp.shard.v4.candidates(prefix).is_empty(),
+            "the route leaves the Loc-RIB again"
+        );
+        assert!(
+            bgp.shard
+                .adj_in(ident)
+                .is_some_and(|a| a.v4.0.contains_key(&prefix)),
+            "the route stays in the Adj-RIB-In"
+        );
+
+        config_ebgp_requires_policy(&mut bgp, arg_words(&["true"]), ConfigOp::Delete).unwrap();
+        assert_eq!(bgp.ebgp_requires_policy, EbgpRequiresPolicy(false));
+        assert!(
+            !bgp.shard.v4.candidates(prefix).is_empty(),
+            "delete restores the default and the route comes back"
+        );
+        assert!(drain_stop_events(&mut bgp).is_empty(), "no session reset");
+        assert!(bgp.peers.get(&peer_addr()).unwrap().state.is_established());
+    }
+
+    /// The per-AFI `prefix-sid` and `send-community` knobs: set and delete
+    /// reach the peer's per-family config, and a change on an Established
+    /// peer queues its outbound re-sync.
+    #[tokio::test]
+    async fn prefix_sid_and_send_community_knobs_reach_the_peer() {
+        use crate::bgp::attr_filter::{PrefixSidBoundary, SendCommunity};
+        let mut bgp = fresh_bgp();
+        let (ident, _) = established_ebgp_with_route(&mut bgp);
+        let v4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+
+        config_prefix_sid_send(
+            &mut bgp,
+            arg_words(&["10.0.0.1", "ipv4", "true"]),
+            ConfigOp::Set,
+        )
+        .unwrap();
+        config_prefix_sid_accept(
+            &mut bgp,
+            arg_words(&["10.0.0.1", "ipv4", "true"]),
+            ConfigOp::Set,
+        )
+        .unwrap();
+        config_send_community_large(
+            &mut bgp,
+            arg_words(&["10.0.0.1", "ipv4", "false"]),
+            ConfigOp::Set,
+        )
+        .unwrap();
+        let peer = bgp.peers.get(&peer_addr()).unwrap();
+        assert_eq!(
+            peer.config.sub[&v4u].prefix_sid,
+            PrefixSidBoundary {
+                send: true,
+                accept: true
+            }
+        );
+        assert_eq!(
+            peer.send_community(v4u),
+            SendCommunity {
+                large: false,
+                ..Default::default()
+            }
+        );
+        assert!(bgp.regroup_resync.contains(&ident));
+
+        config_send_community_large(
+            &mut bgp,
+            arg_words(&["10.0.0.1", "ipv4", "false"]),
+            ConfigOp::Delete,
+        )
+        .unwrap();
+        config_prefix_sid_send(
+            &mut bgp,
+            arg_words(&["10.0.0.1", "ipv4", "true"]),
+            ConfigOp::Delete,
+        )
+        .unwrap();
+        let peer = bgp.peers.get(&peer_addr()).unwrap();
+        assert_eq!(peer.send_community(v4u), SendCommunity::default());
+        assert!(!peer.config.sub[&v4u].prefix_sid.send);
+        assert!(drain_stop_events(&mut bgp).is_empty(), "no session reset");
     }
 
     /// `fast-external-failover` is a default-ON global boolean (IOS-XR
@@ -12166,6 +12468,7 @@ mod transit_label_tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         })
     }
 

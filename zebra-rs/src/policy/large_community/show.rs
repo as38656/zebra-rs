@@ -65,5 +65,6 @@ fn format_matcher(matcher: &LargeCommunityMatcher) -> String {
     match matcher {
         LargeCommunityMatcher::Exact(val) => val.to_str(),
         LargeCommunityMatcher::Regex(compiled) => compiled.pattern().to_string(),
+        LargeCommunityMatcher::Wildcard(pattern) => pattern.to_string(),
     }
 }

@@ -32,6 +32,7 @@
 
 use bgp_packet::{AddPathSendReceive, AfiSafi};
 
+use super::attr_filter::CommunityKind;
 use super::peer::{AfiSafiEncapType, PeerConfig};
 use crate::config::{Args, ConfigOp};
 
@@ -137,6 +138,80 @@ pub(super) fn set_next_hop_unchanged(
     let value = op.is_set() && args.boolean()?;
     cfg.sub.entry(afi_safi).or_default().next_hop_unchanged = value;
     Some(())
+}
+
+/// `afi-safi <name> prefix-sid send <bool>`. Delete closes the boundary
+/// again (RFC 8669 §5.1).
+pub(super) fn set_prefix_sid_send(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let value = op.is_set() && args.boolean()?;
+    cfg.sub.entry(afi_safi).or_default().prefix_sid.send = value;
+    Some(())
+}
+
+/// `afi-safi <name> prefix-sid accept <bool>`. Delete closes the boundary
+/// again (RFC 8669 §4).
+pub(super) fn set_prefix_sid_accept(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let value = op.is_set() && args.boolean()?;
+    cfg.sub.entry(afi_safi).or_default().prefix_sid.accept = value;
+    Some(())
+}
+
+/// `afi-safi <name> send-community <standard|extended|large> <bool>`.
+/// Delete restores the default, which sends the community.
+fn set_send_community(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    kind: CommunityKind,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let send = if op.is_set() { args.boolean()? } else { true };
+    cfg.sub
+        .entry(afi_safi)
+        .or_default()
+        .send_community
+        .set(kind, send);
+    Some(())
+}
+
+/// `afi-safi <name> send-community standard <bool>`.
+pub(super) fn set_send_community_standard(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    set_send_community(cfg, afi_safi, CommunityKind::Standard, op, args)
+}
+
+/// `afi-safi <name> send-community extended <bool>`.
+pub(super) fn set_send_community_extended(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    set_send_community(cfg, afi_safi, CommunityKind::Extended, op, args)
+}
+
+/// `afi-safi <name> send-community large <bool>`.
+pub(super) fn set_send_community_large(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    set_send_community(cfg, afi_safi, CommunityKind::Large, op, args)
 }
 
 /// `afi-safi <name> next-hop-self <bool>` — records the verbatim

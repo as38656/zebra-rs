@@ -54,3 +54,58 @@ pub struct OutPolicy {
     pub prefix_set: PrefixSetValue,
     pub policy_list: PolicyListValue,
 }
+
+/// What one direction of a session does with a route when no route-policy
+/// and no prefix-set is bound to it.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnboundPolicy {
+    /// The route passes unchanged.
+    #[default]
+    Permit,
+    /// The route is dropped: RFC 8212 §3 for an external session under
+    /// `ebgp-requires-policy`.
+    Deny,
+}
+
+/// `ebgp-requires-policy` (RFC 8212), set per BGP instance (`router bgp`
+/// and each `router bgp vrf`). RFC 8212 §3 asks for "on" as the default;
+/// the default here is off so existing configs keep working.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EbgpRequiresPolicy(pub bool);
+
+impl EbgpRequiresPolicy {
+    /// The verdict for a route on a session of `peer_type` when no
+    /// policy is bound in its direction.
+    pub fn unbound_policy(self, peer_type: super::peer::PeerType) -> UnboundPolicy {
+        if self.0 && peer_type.is_ebgp() {
+            UnboundPolicy::Deny
+        } else {
+            UnboundPolicy::Permit
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::peer::PeerType;
+    use super::*;
+
+    #[test]
+    fn the_default_is_off_so_existing_configs_keep_working() {
+        assert_eq!(EbgpRequiresPolicy::default(), EbgpRequiresPolicy(false));
+    }
+
+    #[test]
+    fn rfc8212_denies_unbound_routes_on_external_sessions_only() {
+        let on = EbgpRequiresPolicy(true);
+        assert_eq!(on.unbound_policy(PeerType::EBGP), UnboundPolicy::Deny);
+        assert_eq!(on.unbound_policy(PeerType::IBGP), UnboundPolicy::Permit);
+    }
+
+    #[test]
+    fn ebgp_requires_policy_false_permits_unbound_routes() {
+        let off = EbgpRequiresPolicy(false);
+        assert_eq!(off.unbound_policy(PeerType::EBGP), UnboundPolicy::Permit);
+        assert_eq!(off.unbound_policy(PeerType::IBGP), UnboundPolicy::Permit);
+    }
+}

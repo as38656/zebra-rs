@@ -10,9 +10,9 @@ use nom_derive::*;
 use bytes::BufMut;
 
 use crate::{
-    Afi, AttrFlags, AttrType, BgpLsNlri, EvpnRoute, FlowspecNlri, Ipv4Nlri, Ipv6Nlri, Labelv4Nlri,
-    Labelv6Nlri, MupRoute, ParseBe, ParseNlri, ParseOption, Rtcv4, Rtcv6, Safi, SrPolicyNlri,
-    Vpnv4Nexthop, Vpnv4Nlri, Vpnv6Nexthop, Vpnv6Nlri, esi_display, parse_nlri_block,
+    Afi, AfiSafi, AttrFlags, AttrType, BgpLsNlri, EvpnRoute, FlowspecNlri, Ipv4Nlri, Ipv6Nlri,
+    Labelv4Nlri, Labelv6Nlri, MupRoute, ParseBe, ParseNlri, ParseOption, Rtcv4, Rtcv6, Safi,
+    SrPolicyNlri, Vpnv4Nexthop, Vpnv4Nlri, Vpnv6Nexthop, Vpnv6Nlri, esi_display, parse_nlri_block,
 };
 
 use super::{AttrEmitter, RouteDistinguisher, Rtcv4Reach, Rtcv6Reach, Vpnv4Reach, Vpnv6Reach};
@@ -120,6 +120,26 @@ pub enum MpReachAttr {
 }
 
 impl MpReachAttr {
+    /// The address family of the reachable NLRI this attribute carries.
+    pub fn afi_safi(&self) -> AfiSafi {
+        let (afi, safi) = match self {
+            MpReachAttr::Ipv4 { .. } => (Afi::Ip, Safi::Unicast),
+            MpReachAttr::Ipv6 { .. } => (Afi::Ip6, Safi::Unicast),
+            MpReachAttr::Vpnv4(_) => (Afi::Ip, Safi::MplsVpn),
+            MpReachAttr::Vpnv6(_) => (Afi::Ip6, Safi::MplsVpn),
+            MpReachAttr::Evpn { .. } => (Afi::L2vpn, Safi::Evpn),
+            MpReachAttr::Rtcv4(_) => (Afi::Ip, Safi::Rtc),
+            MpReachAttr::Rtcv6(_) => (Afi::Ip6, Safi::Rtc),
+            MpReachAttr::Mup { afi, .. } => (*afi, Safi::Mup),
+            MpReachAttr::Flowspec { afi, .. } => (*afi, Safi::Flowspec),
+            MpReachAttr::Labelv4 { .. } => (Afi::Ip, Safi::MplsLabel),
+            MpReachAttr::Labelv6 { .. } => (Afi::Ip6, Safi::MplsLabel),
+            MpReachAttr::SrPolicy { afi, .. } => (*afi, Safi::SrTePolicy),
+            MpReachAttr::LinkState { .. } => (Afi::LinkState, Safi::LinkState),
+        };
+        AfiSafi::new(afi, safi)
+    }
+
     pub fn attr_emit(&self, buf: &mut BytesMut) {
         match self {
             MpReachAttr::Vpnv4(nlri) => {

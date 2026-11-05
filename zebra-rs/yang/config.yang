@@ -169,6 +169,10 @@ module config {
     prefix zbasw;
   }
 
+  import zebra-bgp-ebgp-requires-policy {
+    prefix zberp;
+  }
+
   import zebra-bgp-remove-private-as {
     prefix zbrpa;
   }
@@ -5573,7 +5577,11 @@ module config {
         ext:help "Community values in this set";
         type string;
         description
-          "Members of the community set";
+          "Members of the community set. Each member is a value
+           (`64500:100` or a well-known name such as `no-export`),
+           a pattern where `*` stands for any value of one field
+           (`64500:*`, `*:1001`), or a regex applied to the
+           `ASN:NN` text of each community.";
       }
     }
 
@@ -5608,14 +5616,15 @@ module config {
         type string;
       }
       leaf-list members {
-        ext:help "Large-community matchers (A:B:C or regex)";
+        ext:help "Large-community matchers (A:B:C, pattern or regex)";
         type string;
         description
-          "Large-community matchers. Each member is either an
-           exact `A:B:C` triple (three colon-separated uint32s
-           per RFC 8092) or a regex applied to the textual
-           `A:B:C` form of each LARGE_COMMUNITIES element on
-           the route.";
+          "Large-community matchers. Each member is an exact
+           `A:B:C` triple (three colon-separated uint32s per
+           RFC 8092), a pattern where `*` stands for any value of
+           one field (`64500:*:*`), or a regex applied to the
+           textual `A:B:C` form of each LARGE_COMMUNITIES element
+           on the route.";
       }
     }
 
@@ -6346,9 +6355,10 @@ module config {
               "Apply a community-set to the route. The choice
                between {replace-case|additive-case|delete-case}
                selects the operation: replace (default) overwrites
-               the COMMUNITIES attribute with the set's members,
-               additive merges them in, delete removes them from
-               the existing attribute (set difference).";
+               the COMMUNITIES attribute with the set's exact
+               members, additive merges them in, delete removes
+               every community that matches any member, patterns
+               and regexes included.";
             leaf "name" {
               ext:help "Community-set to apply";
               type string;
@@ -6379,8 +6389,8 @@ module config {
                   ext:help "Remove from existing communities";
                   type empty;
                   description
-                    "Remove the set's members from the existing
-                     COMMUNITIES attribute.";
+                    "Remove every community of the COMMUNITIES
+                     attribute that matches a member of the set.";
                 }
               }
             }
@@ -6438,9 +6448,9 @@ module config {
             description
               "Apply a large-community-set to the route. Same
                {replace|additive|delete} choice as `set community`,
-               applied to the LARGE_COMMUNITIES attribute. Only exact
-               `A:B:C` members contribute concrete values; regex
-               members are skipped.";
+               applied to the LARGE_COMMUNITIES attribute. Replace
+               and additive use only the exact `A:B:C` members;
+               delete removes every value that matches any member.";
             leaf "name" {
               ext:help "Large-community-set to apply";
               type string;
@@ -6470,8 +6480,8 @@ module config {
                   ext:help "Remove from existing large communities";
                   type empty;
                   description
-                    "Remove the set's members from the existing
-                     LARGE_COMMUNITIES attribute.";
+                    "Remove every large community that matches a
+                     member of the set.";
                 }
               }
             }

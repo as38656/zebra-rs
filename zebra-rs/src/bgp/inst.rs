@@ -1086,6 +1086,10 @@ pub struct Bgp {
     /// whose AS_PATH carries AS_SET or AS_CONFED_SET as withdraw, and
     /// do not advertise such segments on egress.
     pub as_sets_withdraw: bool,
+    /// `router bgp ebgp-requires-policy` (RFC 8212). Each peer keeps a
+    /// copy ([`super::peer::Peer::ebgp_requires_policy`]), updated by
+    /// [`super::config::sync_ebgp_requires_policy`].
+    pub ebgp_requires_policy: super::policy::EbgpRequiresPolicy,
     pub peers: PeerMap,
     /// Instance-level BFD defaults (`router bgp { bfd {} }`), inherited by
     /// every neighbor and overridden per neighbor (see
@@ -1622,6 +1626,7 @@ impl Bgp {
             no_fib_install: false,
             fast_external_failover: true,
             as_sets_withdraw: true,
+            ebgp_requires_policy: super::policy::EbgpRequiresPolicy::default(),
             peers: PeerMap::new(),
             bfd: PeerBfdConfig::default(),
             tx,
@@ -3101,6 +3106,7 @@ impl Bgp {
         // below so a respawned VRF (which re-materializes every neighbor at
         // spawn) is correctly skipped.
         self.apply_vrf_neighbor_diffs(&to_respawn);
+        self.apply_vrf_policy_knob(&to_respawn);
 
         // Reuse the full teardown/spawn path: it unregisters the old show
         // client, purges exports before label reuse, clears peer_index, then
@@ -3309,6 +3315,29 @@ impl Bgp {
                     let _ = handle.inbox.send(BgpVrfMsg::RemovePeer { addr });
                 }
                 peer_index_unregister(&mut self.peer_index, &name, addr);
+            }
+        }
+    }
+
+    /// Send a changed `ebgp-requires-policy` to each VRF task that keeps
+    /// running through this commit. A spawned or respawned task reads it
+    /// from its config.
+    fn apply_vrf_policy_knob(&self, to_respawn: &[String]) {
+        use super::vrf::msg::BgpVrfMsg;
+        for (name, desired) in &self.vrfs {
+            if to_respawn.iter().any(|n| n == name) {
+                continue;
+            }
+            let (Some(handle), Some(baseline)) = (
+                self.vrf_registry.get(name),
+                self.vrf_commit_baseline.get(name),
+            ) else {
+                continue;
+            };
+            if baseline.ebgp_requires_policy != desired.ebgp_requires_policy {
+                let _ = handle
+                    .inbox
+                    .send(BgpVrfMsg::EbgpRequiresPolicy(desired.ebgp_requires_policy));
             }
         }
     }

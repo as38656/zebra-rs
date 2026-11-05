@@ -16,4 +16,13 @@ impl CommunitySet {
     pub fn matches(&self, bgp_attr: &BgpAttr) -> bool {
         self.vals.iter().any(|x| match_community_set(x, bgp_attr))
     }
+
+    /// Whether the standard community `value` matches a member: an exact
+    /// value, a `*` pattern or a regex.
+    pub fn has_standard(&self, value: u32) -> bool {
+        self.vals.iter().any(|m| match m {
+            CommunityMatcher::Standard(standard) => standard.matches(value),
+            CommunityMatcher::Extended(_) => false,
+        })
+    }
 }

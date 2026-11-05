@@ -5439,6 +5439,68 @@ mod yang_load_tests {
         );
     }
 
+    /// The eBGP safety knobs: `ebgp-requires-policy` (RFC 8212) on the
+    /// global and the per-VRF instance, and the per-AFI `prefix-sid` and
+    /// `send-community` statements on both neighbor kinds. Pinned because
+    /// vtyctl apply is garbage-tolerant — an unwired grammar silently
+    /// no-ops.
+    #[test]
+    fn bgp_ebgp_safety_grammar() {
+        use crate::config::ExecCode;
+        use crate::config::parse::{State, parse};
+        use libyang::to_entry;
+
+        let mut yang = YangStore::new();
+        yang.add_path(concat!(env!("CARGO_MANIFEST_DIR"), "/yang"));
+        yang.read_with_resolve("configure")
+            .expect("configure mode loads");
+        yang.identity_resolve();
+        let module = yang
+            .find_module("configure")
+            .expect("configure module present");
+        let entry = to_entry(&yang, module);
+
+        let neighbors = [
+            "set router bgp neighbor 10.0.0.1",
+            "set router bgp vrf red neighbor 10.0.0.2",
+        ];
+        let mut valid = vec![
+            "set router bgp ebgp-requires-policy true".to_string(),
+            "set router bgp ebgp-requires-policy false".to_string(),
+            "set router bgp vrf red ebgp-requires-policy false".to_string(),
+        ];
+        for nbr in neighbors {
+            for afi in ["ipv4", "ipv6"] {
+                for knob in [
+                    "prefix-sid send true",
+                    "prefix-sid accept true",
+                    "send-community standard false",
+                    "send-community extended false",
+                    "send-community large false",
+                ] {
+                    valid.push(format!("{nbr} afi-safi {afi} {knob}"));
+                }
+            }
+        }
+        for cmd in &valid {
+            let (code, _comps, _state) = parse(cmd, entry.clone(), None, State::new());
+            assert_eq!(code, ExecCode::Success, "`{cmd}` must be a valid path");
+        }
+
+        for cmd in [
+            "set router bgp ebgp-requires-policy",
+            "set router bgp neighbor 10.0.0.1 afi-safi ipv4 prefix-sid send",
+            "set router bgp neighbor 10.0.0.1 afi-safi ipv4 send-community standard",
+        ] {
+            let (code, _comps, _state) = parse(cmd, entry.clone(), None, State::new());
+            assert_ne!(
+                code,
+                ExecCode::Success,
+                "`{cmd}`: boolean leaf — the value-less spelling must not parse",
+            );
+        }
+    }
+
     /// `neighbor X ip-transparent` (zebra-bgp-transport.yang) must be a
     /// settable path on the neighbor and on the neighbor-group (the
     /// group reuses the transport grouping via `uses`). Guards against

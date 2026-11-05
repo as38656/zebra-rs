@@ -255,6 +255,7 @@ fn learn_in_pool(bgp: &Bgp) {
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }),
     );
 }

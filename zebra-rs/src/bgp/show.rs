@@ -284,7 +284,12 @@ fn write_summary_peer_row(
         "NoNeg".to_string()
     } else {
         let (pr, ps) = summary_pfx_counts(shard, peer, afi, safi, counts);
-        format!("{}/{}", pr, ps)
+        let missing = MissingPolicyView::of(peer, AfiSafi::new(afi, safi));
+        format!(
+            "{}/{}",
+            pfx_cell(pr, missing.is_some_and(|m| m.inbound)),
+            pfx_cell(ps, missing.is_some_and(|m| m.outbound))
+        )
     };
 
     let hostname = peer
@@ -312,6 +317,16 @@ fn write_summary_peer_row(
         pfx_str,
         hostname,
     )
+}
+
+/// A prefix count of the summary, or FRR's `(Policy)` when RFC 8212 lets
+/// no route through that direction.
+fn pfx_cell(count: u64, policy_missing: bool) -> String {
+    if policy_missing {
+        "(Policy)".to_string()
+    } else {
+        count.to_string()
+    }
 }
 
 fn write_summary_section<V: BgpShowView>(
@@ -559,6 +574,11 @@ struct BgpPeerSummaryJson {
     state: String,
     pfx_rcvd: u64,
     pfx_sent: u64,
+    /// The directions of this family that exchange no route because no
+    /// policy is bound (RFC 8212). Absent when both have one or the
+    /// session does not need one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_missing: Option<MissingPolicyView>,
 }
 
 #[derive(Serialize)]
@@ -2400,13 +2420,14 @@ fn summary_peer_row_json(
     }
 
     let (pfx_rcvd, pfx_sent) = summary_pfx_counts(shard, peer, afi, safi, counts);
+    let policy_missing = MissingPolicyView::of(peer, AfiSafi::new(afi, safi));
 
     // FRR-style State/PfxRcd column: an Established session shows its
     // received-prefix count in place of the state word.
     let state = if peer.state != State::Established {
         peer.state.to_str().to_string()
     } else {
-        pfx_rcvd.to_string()
+        pfx_cell(pfx_rcvd, policy_missing.is_some_and(|m| m.inbound))
     };
 
     BgpPeerSummaryJson {
@@ -2419,6 +2440,7 @@ fn summary_peer_row_json(
         state,
         pfx_rcvd,
         pfx_sent,
+        policy_missing,
     }
 }
 
@@ -3981,6 +4003,54 @@ struct Neighbor<'a> {
     /// when nothing is bound.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     policy_bindings: Vec<PolicyBindingView>,
+    /// Families that exchange no route in a direction because no policy
+    /// is bound there (RFC 8212).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_policy: Vec<FamilyMissingPolicyView>,
+    /// UPDATEs whose BGP Prefix-SID was discarded on receipt (RFC 8669
+    /// §4).
+    prefix_sid_discarded: u64,
+}
+
+/// The directions of one family with no policy under RFC 8212.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct MissingPolicyView {
+    inbound: bool,
+    outbound: bool,
+}
+
+impl MissingPolicyView {
+    /// `None` when both directions of `afi_safi` have what they need.
+    fn of(peer: &Peer, afi_safi: AfiSafi) -> Option<Self> {
+        use super::policy::InOut;
+        let view = Self {
+            inbound: peer.missing_policy(afi_safi, InOut::Input),
+            outbound: peer.missing_policy(afi_safi, InOut::Output),
+        };
+        (view.inbound || view.outbound).then_some(view)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FamilyMissingPolicyView {
+    scope: String,
+    #[serde(flatten)]
+    missing: MissingPolicyView,
+}
+
+/// Every configured family of `peer` that RFC 8212 closes in a direction.
+fn collect_missing_policy(peer: &Peer) -> Vec<FamilyMissingPolicyView> {
+    peer.config
+        .mp
+        .0
+        .keys()
+        .filter_map(|afi_safi| {
+            MissingPolicyView::of(peer, *afi_safi).map(|missing| FamilyMissingPolicyView {
+                scope: afi_safi_config_name(afi_safi).to_string(),
+                missing,
+            })
+        })
+        .collect()
 }
 
 /// One row of a neighbor's configured policy/prefix-set, scoped either
@@ -4272,6 +4342,8 @@ fn fetch(peer: &Peer) -> Neighbor<'_> {
         nd_refresh_count,
         nd_refreshed_secs_ago,
         policy_bindings: collect_policy_bindings(peer),
+        missing_policy: collect_missing_policy(peer),
+        prefix_sid_discarded: peer.prefix_sid_discarded,
     };
 
     // Timers.
@@ -4611,6 +4683,27 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
             }
             writeln!(out, "    {}: {}", b.scope, parts.join(", "))?;
         }
+    }
+
+    if !neighbor.missing_policy.is_empty() {
+        writeln!(out, "  No policy (RFC 8212), updates discarded:")?;
+        for family in &neighbor.missing_policy {
+            let directions: Vec<&str> = [
+                (family.missing.inbound, "inbound"),
+                (family.missing.outbound, "outbound"),
+            ]
+            .into_iter()
+            .filter_map(|(missing, name)| missing.then_some(name))
+            .collect();
+            writeln!(out, "    {}: {}", family.scope, directions.join(", "))?;
+        }
+    }
+    if neighbor.prefix_sid_discarded > 0 {
+        writeln!(
+            out,
+            "  Prefix-SID discarded from {} updates (RFC 8669)",
+            neighbor.prefix_sid_discarded
+        )?;
     }
 
     writeln!(out)?;
@@ -7121,6 +7214,84 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         );
     }
 
+    /// An Established eBGP peer with IPv4 unicast up and no policy.
+    /// An Established eBGP peer with no policy, in an instance that has
+    /// `ebgp-requires-policy true`.
+    fn ebgp_without_policy_under_rfc8212() -> Peer {
+        let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 2).into());
+        peer.peer_type = super::super::peer::PeerType::EBGP;
+        peer.ebgp_requires_policy = super::super::policy::EbgpRequiresPolicy(true);
+        peer.state = State::Established;
+        let key = CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast);
+        let entry = peer.cap_map.entries.get_mut(&key).expect("pre-seeded");
+        entry.send = true;
+        entry.recv = true;
+        peer
+    }
+
+    fn summary_row(peer: &Peer) -> String {
+        let mut buf = String::new();
+        let shard = super::super::shard::BgpShard::default();
+        write_summary_peer_row(&mut buf, &shard, peer, Afi::Ip, Safi::Unicast, None).unwrap();
+        buf
+    }
+
+    /// FRR shows `(Policy)` where RFC 8212 stops a direction: in place of
+    /// the received count when nothing is accepted, of the sent count
+    /// when nothing is advertised.
+    #[test]
+    fn summary_shows_policy_for_each_direction_rfc8212_closes() {
+        use super::super::policy::{EbgpRequiresPolicy, InOut};
+        let mut peer = ebgp_without_policy_under_rfc8212();
+        assert!(
+            summary_row(&peer).contains(" (Policy)/(Policy) "),
+            "{}",
+            summary_row(&peer)
+        );
+
+        peer.policy_list_slot(AfiSafi::new(Afi::Ip, Safi::Unicast), InOut::Input)
+            .name = Some("IN".into());
+        assert!(
+            summary_row(&peer).contains(" 0/(Policy) "),
+            "{}",
+            summary_row(&peer)
+        );
+
+        peer.ebgp_requires_policy = EbgpRequiresPolicy(false);
+        assert!(
+            summary_row(&peer).contains(" 0/0 "),
+            "{}",
+            summary_row(&peer)
+        );
+    }
+
+    #[test]
+    fn summary_json_marks_the_directions_without_policy() {
+        let peer = ebgp_without_policy_under_rfc8212();
+        let shard = super::super::shard::BgpShard::default();
+        let row = summary_peer_row_json(&shard, &peer, Afi::Ip, Safi::Unicast, None);
+        assert_eq!(row.state, "(Policy)");
+        assert_eq!(
+            row.policy_missing,
+            Some(MissingPolicyView {
+                inbound: true,
+                outbound: true,
+            })
+        );
+        let ibgp = make_peer(Ipv4Addr::new(10, 0, 0, 3).into());
+        let row = summary_peer_row_json(&shard, &ibgp, Afi::Ip, Safi::Unicast, None);
+        assert_eq!(row.policy_missing, None);
+    }
+
+    #[test]
+    fn missing_policy_is_collected_per_configured_family() {
+        let peer = ebgp_without_policy_under_rfc8212();
+        let rows = collect_missing_policy(&peer);
+        assert_eq!(rows.len(), 1, "only ipv4 is configured");
+        assert_eq!(rows[0].scope, "ipv4");
+        assert!(rows[0].missing.inbound && rows[0].missing.outbound);
+    }
+
     /// JSON summary: the unnumbered row is identified by the interface
     /// name and carries an `interface` field marking its provenance;
     /// address-keyed rows must not grow one.
@@ -7308,6 +7479,43 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         );
     }
 
+    /// RFC 8212: `show bgp neighbor` names the directions of each family
+    /// that exchange no route for lack of a policy, and counts discarded
+    /// Prefix-SIDs.
+    #[test]
+    fn neighbor_detail_shows_missing_policy_and_discarded_prefix_sids() {
+        let mut out = String::new();
+        let mut n = minimal_neighbor(None);
+        n.missing_policy = vec![
+            FamilyMissingPolicyView {
+                scope: "ipv4".to_string(),
+                missing: MissingPolicyView {
+                    inbound: true,
+                    outbound: true,
+                },
+            },
+            FamilyMissingPolicyView {
+                scope: "ipv6".to_string(),
+                missing: MissingPolicyView {
+                    inbound: false,
+                    outbound: true,
+                },
+            },
+        ];
+        n.prefix_sid_discarded = 3;
+        render(&mut out, &n).unwrap();
+        assert!(
+            out.contains("  No policy (RFC 8212), updates discarded:"),
+            "missing header:\n{out}"
+        );
+        assert!(out.contains("    ipv4: inbound, outbound"), "{out}");
+        assert!(out.contains("    ipv6: outbound"), "{out}");
+        assert!(
+            out.contains("  Prefix-SID discarded from 3 updates (RFC 8669)"),
+            "{out}"
+        );
+    }
+
     /// `show bgp neighbor` lists per-AFI policy/prefix-set bindings and
     /// the peer-wide fallback (group-inherited), family-scoped rows first.
     #[test]
@@ -7427,6 +7635,8 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
             nd_refresh_count: None,
             nd_refreshed_secs_ago: None,
             policy_bindings: Vec::new(),
+            missing_policy: Vec::new(),
+            prefix_sid_discarded: 0,
         }
     }
 }

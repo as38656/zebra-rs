@@ -5,8 +5,9 @@ use bytes::BytesMut;
 use crate::{
     Aggregator, Aggregator2, Aigp, As2Path, As4Aggregator, As4Path, As4PathAttr, AtomicAggregate,
     AttrEmitter, BgpLsAttr, BgpNexthop, ClusterList, Color, Community, ExtCommunity,
-    LargeCommunity, LocalPref, Med, NexthopAttr, Origin, OriginatorId, Otc, PmsiTunnel, PrefixSid,
-    PrefixSidTlv, TunnelEncap, UnknownAttr,
+    IPV6_EXT_COMMUNITY_TYPE_CODE, LargeCommunity, LocalPref, Med, NexthopAttr, Origin,
+    OriginatorId, Otc, PmsiTunnel, PrefixSid, PrefixSidTlv, TunnelEncap, UnknownAttr,
+    ipv6_ext_community_without_route_targets,
 };
 
 // BGP Attribute for quick access to each attribute. This would be used for
@@ -182,6 +183,38 @@ impl BgpAttr {
         self.aspath
             .as_ref()
             .and_then(|aspath| aspath.neighboring_as())
+    }
+
+    /// Remove every Route Target: from EXT_COMMUNITIES and from the IPv6
+    /// Address Specific Extended Community attribute. The other extended
+    /// communities stay.
+    pub fn remove_route_targets(&mut self) {
+        if let Some(ecom) = self.ecom.as_mut() {
+            ecom.0.retain(|v| !v.is_route_target());
+            if ecom.0.is_empty() {
+                self.ecom = None;
+            }
+        }
+        self.unknown.retain_mut(|attr| {
+            if attr.type_code != IPV6_EXT_COMMUNITY_TYPE_CODE {
+                return true;
+            }
+            match ipv6_ext_community_without_route_targets(&attr.value) {
+                Some(kept) => {
+                    attr.value = kept;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    /// Remove EXT_COMMUNITIES and the IPv6 Address Specific Extended
+    /// Community attribute.
+    pub fn remove_extended_communities(&mut self) {
+        self.ecom = None;
+        self.unknown
+            .retain(|attr| attr.type_code != IPV6_EXT_COMMUNITY_TYPE_CODE);
     }
 
     /// Extract the Label-Index value carried in the BGP Prefix-SID
@@ -531,5 +564,104 @@ mod tests {
         let cols: Vec<Color> = attr.colors().collect();
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].color, 42);
+    }
+}
+
+#[cfg(test)]
+mod route_target_tests {
+    use crate::*;
+    use bytes::BytesMut;
+    use std::net::Ipv6Addr;
+
+    fn ecom(high_type: u8, low_type: u8) -> ExtCommunityValue {
+        ExtCommunityValue {
+            high_type,
+            low_type,
+            val: [0, 1, 0, 0, 0, 100],
+        }
+    }
+
+    /// A raw IPv6 Address Specific Extended Community attribute holding
+    /// `entries`, as it is kept after receive (unrecognized, transitive).
+    fn ipv6_ecom_attr(entries: &[ExtIpv6CommunityValue]) -> UnknownAttr {
+        let mut value = BytesMut::new();
+        for e in entries {
+            e.encode(&mut value);
+        }
+        UnknownAttr::new(0xc0, IPV6_EXT_COMMUNITY_TYPE_CODE, value.to_vec())
+    }
+
+    fn ipv6_soo() -> ExtIpv6CommunityValue {
+        let mut soo = ExtIpv6CommunityValue::new(Ipv6Addr::LOCALHOST, 7);
+        soo.low_type = ExtCommunitySubType::RouteOrigin as u8;
+        soo
+    }
+
+    /// RFC 4360 §4 / RFC 5668 §3 / RFC 5701 §3: every Route Target form
+    /// goes, and nothing else does.
+    #[test]
+    fn remove_route_targets_keeps_other_extended_communities() {
+        let mut attr = BgpAttr {
+            ecom: Some(ExtCommunity::from([
+                ecom(0x00, 0x02), // RT, two-octet AS
+                ecom(0x01, 0x02), // RT, IPv4 address
+                ecom(0x02, 0x02), // RT, four-octet AS
+                ecom(0x00, 0x03), // Site of Origin
+                ecom(0x40, 0x02), // non-transitive, not a Route Target
+                ExtCommunityValue::from_color(0, 42),
+            ])),
+            unknown: vec![ipv6_ecom_attr(&[
+                ExtIpv6CommunityValue::new(Ipv6Addr::LOCALHOST, 100),
+                ipv6_soo(),
+            ])],
+            ..Default::default()
+        };
+
+        attr.remove_route_targets();
+
+        let kept: Vec<(u8, u8)> = attr
+            .ecom
+            .as_ref()
+            .expect("non-RT extended communities stay")
+            .0
+            .iter()
+            .map(|v| (v.high_type, v.low_type))
+            .collect();
+        assert_eq!(kept, vec![(0x00, 0x03), (0x03, 0x0b), (0x40, 0x02)]);
+        assert_eq!(
+            attr.unknown,
+            vec![ipv6_ecom_attr(&[ipv6_soo()])],
+            "the IPv6 Route Target goes, the IPv6 Site of Origin stays"
+        );
+    }
+
+    /// An attribute left with no entry is dropped, not sent empty.
+    #[test]
+    fn remove_route_targets_drops_attributes_left_empty() {
+        let mut attr = BgpAttr {
+            ecom: Some(ExtCommunity::from([ecom(0x00, 0x02), ecom(0x02, 0x02)])),
+            unknown: vec![ipv6_ecom_attr(&[ExtIpv6CommunityValue::new(
+                Ipv6Addr::LOCALHOST,
+                100,
+            )])],
+            ..Default::default()
+        };
+        attr.remove_route_targets();
+        assert_eq!(attr.ecom, None);
+        assert!(attr.unknown.is_empty());
+    }
+
+    /// Other unrecognized attributes are not touched.
+    #[test]
+    fn remove_extended_communities_drops_both_attributes_only() {
+        let other = UnknownAttr::new(0xc0, 99, vec![1, 2, 3]);
+        let mut attr = BgpAttr {
+            ecom: Some(ExtCommunity::from([ecom(0x00, 0x03)])),
+            unknown: vec![ipv6_ecom_attr(&[ipv6_soo()]), other.clone()],
+            ..Default::default()
+        };
+        attr.remove_extended_communities();
+        assert_eq!(attr.ecom, None);
+        assert_eq!(attr.unknown, vec![other]);
     }
 }

@@ -932,12 +932,29 @@ pub struct PeerSubConfig {
     /// (`route_update_ipv4` / `vpnv4_service_label`) and EVPN
     /// (`route_update_evpn`) advertise paths.
     pub next_hop_unchanged: bool,
+    /// `afi-safi <name> prefix-sid {send,accept}`: whether the BGP
+    /// Prefix-SID crosses this session when it is external. Read through
+    /// [`Peer::prefix_sid_send`] / [`Peer::prefix_sid_accept`].
+    pub prefix_sid: super::attr_filter::PrefixSidBoundary,
+    /// `afi-safi <name> send-community {standard,extended,large}`.
+    pub send_community: super::attr_filter::SendCommunity,
 }
 
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum PeerType {
     IBGP,
     EBGP,
+}
+
+/// Which BGP instance owns a peer.
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy)]
+pub enum PeerInstance {
+    /// A neighbor of the global `router bgp`.
+    #[default]
+    Global,
+    /// A CE neighbor of a `router bgp vrf`. It sits outside the
+    /// provider's VPN, so VPN-internal attributes never reach it.
+    Vrf,
 }
 
 impl PeerType {
@@ -1143,7 +1160,18 @@ pub struct Peer {
     /// (`[0]` = IR1 leak from a Customer / RS-Client, `[1]` = IR2 OTC ≠
     /// remote AS from a Peer). Shown as "By OTC ingress rule 1/2".
     pub otc_denied: [u64; 2],
+    /// UPDATEs whose BGP Prefix-SID attribute was discarded on receipt
+    /// (RFC 8669 §4: external session, family not configured to accept).
+    pub prefix_sid_discarded: u64,
     pub peer_type: PeerType,
+    /// The instance that owns this peer: the global `router bgp`, or a
+    /// `router bgp vrf` task for a CE peer.
+    pub instance: PeerInstance,
+    /// The owning instance's `ebgp-requires-policy` (RFC 8212), resolved
+    /// onto the peer like [`PeerConfig::gr_global`] because the policy
+    /// paths see only the peer. Every peer-creation site seeds it and a
+    /// change of the instance knob sweeps every peer.
+    pub ebgp_requires_policy: super::policy::EbgpRequiresPolicy,
     /// RFC 9572 §6.1 region identifier, resolved from this peer's
     /// neighbor-group (`region-id`) by `apply_inherited`. `Some` marks the
     /// peer as belonging to a segmentation region; the EVPN receive /
@@ -1418,7 +1446,10 @@ impl Peer {
             last_reset: None,
             otc_role_mismatch: None,
             otc_denied: [0; 2],
+            prefix_sid_discarded: 0,
             peer_type: PeerType::IBGP,
+            instance: PeerInstance::Global,
+            ebgp_requires_policy: super::policy::EbgpRequiresPolicy::default(),
             region_id: None,
             state: State::Idle,
             task: PeerTask::default(),
@@ -1854,6 +1885,9 @@ impl Peer {
                 || (self.is_ebgp() && self.config.route_server_client),
             egress_as: self.egress_as(),
             out_policy: self.out_policy.clone(),
+            out_unbound: self.unbound_policy(),
+            post_policy: self.post_policy_filter(AfiSafi::new(Afi::Ip, Safi::Unicast)),
+            prefix_sid_send: self.prefix_sid_send(Afi::Ip),
             packet_tx: self.packet_tx.clone(),
             egress_depth: self.egress_depth.clone(),
             extended_message: self.opt.extended_message,
@@ -1948,6 +1982,110 @@ impl Peer {
     /// SID-presence filtering).
     pub fn ipv6_srv6_strict(&self) -> bool {
         matches!(self.ipv6_srv6_encap(), Some(AfiSafiEncapType::Srv6))
+    }
+
+    /// `afi-safi <name> send-community` for `afi_safi`; every kind is sent
+    /// when the family has no statement.
+    pub fn send_community(&self, afi_safi: AfiSafi) -> super::attr_filter::SendCommunity {
+        self.config
+            .sub
+            .get(&afi_safi)
+            .map(|s| s.send_community)
+            .unwrap_or_default()
+    }
+
+    /// The attribute rules run on this peer's routes of `afi_safi` after
+    /// outbound policy.
+    pub fn post_policy_filter(&self, afi_safi: AfiSafi) -> super::attr_filter::PostPolicyFilter {
+        super::attr_filter::PostPolicyFilter {
+            send_community: self.send_community(afi_safi),
+            strip_route_targets: self.instance == PeerInstance::Vrf,
+        }
+    }
+
+    /// Whether a plain-unicast route of `afi` keeps its BGP Prefix-SID
+    /// toward this peer when the session is external (RFC 8669 §5,
+    /// RFC 9252 §9.2): `afi-safi <afi> prefix-sid send`, or an SRv6
+    /// service configured for the family.
+    pub fn prefix_sid_send(&self, afi: Afi) -> bool {
+        self.prefix_sid_boundary(afi).send || self.srv6_service_configured(afi)
+    }
+
+    /// Whether a plain-unicast route of `afi` received from this peer
+    /// keeps its BGP Prefix-SID when the session is external (RFC 8669
+    /// §4). The receive twin of [`Self::prefix_sid_send`].
+    pub fn prefix_sid_accept(&self, afi: Afi) -> bool {
+        self.prefix_sid_boundary(afi).accept || self.srv6_service_configured(afi)
+    }
+
+    /// The unicast families whose Prefix-SID the parser drops on this
+    /// session ([`ParseOption::prefix_sid_discard`]; the parser applies it
+    /// to external sessions only).
+    pub fn prefix_sid_discard_families(&self) -> BTreeSet<AfiSafi> {
+        [Afi::Ip, Afi::Ip6]
+            .into_iter()
+            .filter(|afi| !self.prefix_sid_accept(*afi))
+            .map(|afi| AfiSafi::new(afi, Safi::Unicast))
+            .collect()
+    }
+
+    /// Every family's non-default `send-community` and `prefix-sid`
+    /// statements, to tell whether a config swap changed what the peer
+    /// may be sent.
+    pub fn attr_filter_config(
+        &self,
+    ) -> BTreeMap<
+        AfiSafi,
+        (
+            super::attr_filter::SendCommunity,
+            super::attr_filter::PrefixSidBoundary,
+        ),
+    > {
+        self.config
+            .sub
+            .iter()
+            .map(|(afi_safi, sub)| (*afi_safi, (sub.send_community, sub.prefix_sid)))
+            .filter(|(_, filters)| *filters != Default::default())
+            .collect()
+    }
+
+    fn prefix_sid_boundary(&self, afi: Afi) -> super::attr_filter::PrefixSidBoundary {
+        self.config
+            .sub
+            .get(&AfiSafi::new(afi, Safi::Unicast))
+            .map(|s| s.prefix_sid)
+            .unwrap_or_default()
+    }
+
+    /// `encapsulation-type srv6[-relax]` is the existing statement that
+    /// this session carries an SRv6 service, which only IPv6 unicast
+    /// honours.
+    fn srv6_service_configured(&self, afi: Afi) -> bool {
+        afi == Afi::Ip6 && self.ipv6_srv6_encap().is_some()
+    }
+
+    /// What a direction of this session does with a route when no policy
+    /// is bound to it (RFC 8212 §3).
+    pub fn unbound_policy(&self) -> super::policy::UnboundPolicy {
+        self.ebgp_requires_policy.unbound_policy(self.peer_type)
+    }
+
+    /// Whether a route-policy or prefix-set is bound to `dir` of
+    /// `afi_safi`. EVPN evaluates only the route-policy, so only that
+    /// counts there.
+    pub fn policy_bound(&self, afi_safi: AfiSafi, dir: super::policy::InOut) -> bool {
+        let policy = self.policy_list_at(afi_safi, dir).name.is_some();
+        if afi_safi == AfiSafi::new(Afi::L2vpn, Safi::Evpn) {
+            return policy;
+        }
+        policy || self.prefix_set_at(afi_safi, dir).name.is_some()
+    }
+
+    /// RFC 8212 §3: `dir` of `afi_safi` exchanges no route because this
+    /// external session has no policy bound there.
+    pub fn missing_policy(&self, afi_safi: AfiSafi, dir: super::policy::InOut) -> bool {
+        self.unbound_policy() == super::policy::UnboundPolicy::Deny
+            && !self.policy_bound(afi_safi, dir)
     }
 
     /// IPv6 link-local next-hop to advertise in MP_REACH for
@@ -3363,10 +3501,8 @@ pub async fn peer_read(
     }
 }
 
-pub fn peer_start_reader(peer: &Peer, conn: ConnId, read_half: OwnedReadHalf) -> Task<()> {
-    let ident = peer.ident;
-    let tx = peer.tx.clone();
-    let config = peer.config.clone();
+/// The parse options a new reader of `peer` starts with.
+pub(super) fn reader_parse_option(peer: &Peer) -> ParseOption {
     let mut opt = peer.opt.clone();
     // Our half of the RFC 6793 negotiation is fixed before the OPEN
     // exchange: it is what `build_open_packet` advertises (the knob, or
@@ -3377,6 +3513,15 @@ pub fn peer_start_reader(peer: &Peer, conn: ConnId, read_half: OwnedReadHalf) ->
     // Internal or external, from configuration (RFC 4271 §1.1): the parser
     // discards a LOCAL_PREF received over an external session (§5.1.5).
     opt.peer_type = peer.peer_type.into();
+    opt.prefix_sid_discard = peer.prefix_sid_discard_families();
+    opt
+}
+
+pub fn peer_start_reader(peer: &Peer, conn: ConnId, read_half: OwnedReadHalf) -> Task<()> {
+    let ident = peer.ident;
+    let tx = peer.tx.clone();
+    let config = peer.config.clone();
+    let opt = reader_parse_option(peer);
     // A fresh connection proves the remote alive right now; without
     // this stamp a pre-flood `last_rx_ms` of 0 would let the very
     // first hold-timer expiry kill a session whose traffic is still
@@ -4112,6 +4257,7 @@ pub(super) fn try_dynamic_accept(
     // GR config callbacks ran, so it must be seeded here or its OPEN
     // (exchanged moments from now) advertises no GR capability.
     peer.config.gr_global = bgp.gr_global_resolved();
+    peer.ebgp_requires_policy = bgp.ebgp_requires_policy;
     // `Peer::new` defaults to iBGP; derive the session type from the
     // group's remote-as the way the addressed, group-sweep and
     // interface-neighbor paths do. It drives the AS_PATH prepend, the

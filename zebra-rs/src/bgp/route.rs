@@ -242,6 +242,13 @@ pub struct SyncCtx {
     pub unicast_next_hop_unchanged: bool,
     pub egress_as: EgressAs,
     pub out_policy: Arc<super::policy::OutPolicy>,
+    /// What the out-policy does when nothing is bound (RFC 8212).
+    pub out_unbound: super::policy::UnboundPolicy,
+    /// The attribute rules run after the out-policy.
+    pub post_policy: super::attr_filter::PostPolicyFilter,
+    /// Plain IPv4-unicast rows keep their BGP Prefix-SID on an external
+    /// session ([`Peer::prefix_sid_send`]).
+    pub prefix_sid_send: bool,
     /// Egress sink (Tier 1b): the peer's writer channel, the shared
     /// in-flight gauge, and the negotiated extended-message flag. Lets the
     /// build enqueue its own UPDATEs (`SyncCtx::send_packet`) without a
@@ -409,6 +416,9 @@ impl SyncCtx {
                 route_server_client: false,
             },
             out_policy: Arc::new(super::policy::OutPolicy::default()),
+            out_unbound: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             packet_tx: None,
             egress_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extended_message: false,
@@ -4016,6 +4026,7 @@ pub fn route_apply_policy_in(
     apply_policy_in_pure(
         peer.prefix_set_at(afi_safi, InOut::Input),
         peer.policy_list_at(afi_safi, InOut::Input),
+        peer.unbound_policy(),
         peer.router_id,
         nlri,
         bgp_attr,
@@ -4031,20 +4042,26 @@ pub fn route_apply_policy_in(
 /// walk + default-permit serves IPv4 and IPv6 in BOTH directions — the
 /// caller picks the direction by passing the Input or Output config
 /// snapshots. `PrefixSet::matches` and `policy_list_apply_net` are both
-/// already dual-stack, so no per-family code is needed here.
+/// already dual-stack, so no per-family code is needed here. `unbound`
+/// decides a route when neither a prefix-set nor a policy-list is bound.
 ///
 /// Mutates nothing (takes config by reference, not `&mut Peer`), so the
 /// batch ingest / advertise paths can run it in parallel across a
 /// packet's prefixes (RIB sharding C.1 / C.2).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_policy_net(
     prefix_cfg: &super::PrefixSetValue,
     policy_cfg: &super::PolicyListValue,
+    unbound: super::policy::UnboundPolicy,
     router_id: Ipv4Addr,
     prefix: IpNet,
     bgp_attr: BgpAttr,
     weight: u32,
     tag: u32,
 ) -> Option<PolicyDecision> {
+    if prefix_cfg.name.is_none() && policy_cfg.name.is_none() {
+        return unbound_decision(unbound, bgp_attr, weight, tag);
+    }
     if prefix_cfg.name.is_some() {
         let Some(prefix_set) = &prefix_cfg.prefix_set else {
             return None;
@@ -4068,9 +4085,11 @@ pub fn apply_policy_net(
 
 /// Inbound-policy evaluation for an IPv4 NLRI: the v4 projection of
 /// [`apply_policy_net`].
+#[allow(clippy::too_many_arguments)]
 pub fn apply_policy_in_pure(
     prefix_cfg: &super::PrefixSetValue,
     policy_cfg: &super::PolicyListValue,
+    unbound: super::policy::UnboundPolicy,
     router_id: Ipv4Addr,
     nlri: &Ipv4Nlri,
     bgp_attr: BgpAttr,
@@ -4080,6 +4099,7 @@ pub fn apply_policy_in_pure(
     apply_policy_net(
         prefix_cfg,
         policy_cfg,
+        unbound,
         router_id,
         IpNet::V4(nlri.prefix),
         bgp_attr,
@@ -4091,8 +4111,8 @@ pub fn apply_policy_in_pure(
 /// Inbound policy entry point for an EVPN route. Mirrors
 /// `route_apply_policy_in` but skips the per-direction prefix-set
 /// (no IPv4 prefix on EVPN NLRIs) and dispatches to
-/// `policy_list_apply_evpn`. When no input policy-list is bound
-/// to the peer the route passes through unmodified.
+/// `policy_list_apply_evpn`. When no input policy-list is bound the
+/// peer's [`Peer::unbound_policy`] decides.
 pub fn route_apply_policy_in_evpn(
     peer: &mut Peer,
     route: &EvpnRoute,
@@ -4107,20 +4127,35 @@ pub fn route_apply_policy_in_evpn(
         };
         return policy_list_apply_evpn(policy_list, route, bgp_attr, weight, peer.router_id);
     }
-    Some(PolicyDecision {
-        attr: bgp_attr,
+    unbound_decision(
+        peer.unbound_policy(),
+        bgp_attr,
         weight,
         // Route tags are a v4/v6-unicast concept here; the EVPN paths
         // neither set nor match them.
-        tag: 0,
-    })
+        0,
+    )
+}
+
+/// The decision for a route when no prefix-set and no policy-list is
+/// bound to its direction.
+fn unbound_decision(
+    unbound: super::policy::UnboundPolicy,
+    attr: BgpAttr,
+    weight: u32,
+    tag: u32,
+) -> Option<PolicyDecision> {
+    match unbound {
+        super::policy::UnboundPolicy::Permit => Some(PolicyDecision { attr, weight, tag }),
+        super::policy::UnboundPolicy::Deny => None,
+    }
 }
 
 /// Outbound policy entry point for an EVPN route. Mirrors
 /// `route_apply_policy_out` but skips the per-direction prefix-set
 /// (no IPv4 prefix on EVPN NLRIs) and dispatches to
-/// `policy_list_apply_evpn`. Default-permit when no output
-/// policy-list is bound, same as the IPv4 outbound path.
+/// `policy_list_apply_evpn`. When no output policy-list is bound the
+/// peer's [`Peer::unbound_policy`] decides, as on the IPv4 outbound path.
 pub fn route_apply_policy_out_evpn(
     peer: &mut Peer,
     route: &EvpnRoute,
@@ -4138,11 +4173,7 @@ pub fn route_apply_policy_out_evpn(
                 None => None,
             }
         } else {
-            Some(PolicyDecision {
-                attr: bgp_attr,
-                weight,
-                tag: 0,
-            })
+            unbound_decision(peer.unbound_policy(), bgp_attr, weight, 0)
         }
     };
     // EVPN egress (Adj-RIB-Out) Lua hook after native out-policy. EVPN
@@ -4151,7 +4182,18 @@ pub fn route_apply_policy_out_evpn(
     // folds the rewritten attributes in (e.g. add the GBP GPI ecom).
     #[cfg(feature = "lua")]
     let decision = apply_egress_evpn(route, decision, peer);
-    decision
+    post_policy(decision, &peer.post_policy_filter(evpn))
+}
+
+/// Run the per-neighbor attribute rules on an outbound decision; they
+/// come after every policy, so no policy can undo them.
+fn post_policy(
+    decision: Option<PolicyDecision>,
+    filter: &super::attr_filter::PostPolicyFilter,
+) -> Option<PolicyDecision> {
+    let mut decision = decision?;
+    filter.apply(&mut decision.attr);
+    Some(decision)
 }
 
 /// Apply the bound EVPN egress (Adj-RIB-Out) Lua hook to a native
@@ -4190,6 +4232,7 @@ pub fn route_apply_policy_out(
     let decision = apply_policy_net(
         &ctx.out_policy.prefix_set,
         &ctx.out_policy.policy_list,
+        ctx.out_unbound,
         ctx.router_id,
         IpNet::V4(nlri.prefix),
         bgp_attr,
@@ -4201,7 +4244,7 @@ pub fn route_apply_policy_out(
     // singleton group, so it runs per-peer.
     #[cfg(feature = "lua")]
     let decision = ctx.apply_egress_v4(IpNet::V4(nlri.prefix), decision);
-    decision
+    post_policy(decision, &ctx.post_policy)
 }
 
 /// Per-AFI v4-family outbound policy: the v4 twin of
@@ -4219,15 +4262,17 @@ pub fn route_apply_policy_out_at(
     weight: u32,
     tag: u32,
 ) -> Option<PolicyDecision> {
-    apply_policy_net(
+    let decision = apply_policy_net(
         peer.prefix_set_at(afi_safi, InOut::Output),
         peer.policy_list_at(afi_safi, InOut::Output),
+        peer.unbound_policy(),
         peer.router_id,
         IpNet::V4(nlri.prefix),
         bgp_attr,
         weight,
         tag,
-    )
+    );
+    post_policy(decision, &peer.post_policy_filter(afi_safi))
 }
 
 /// Inbound-policy evaluation for an IPv6 NLRI: the v6 / Input projection
@@ -4245,6 +4290,7 @@ pub fn route_apply_policy_in_v6(
     apply_policy_net(
         peer.prefix_set_at(afi_safi, InOut::Input),
         peer.policy_list_at(afi_safi, InOut::Input),
+        peer.unbound_policy(),
         peer.router_id,
         IpNet::V6(nlri.prefix),
         bgp_attr,
@@ -4263,15 +4309,17 @@ pub fn route_apply_policy_out_v6(
     weight: u32,
     tag: u32,
 ) -> Option<PolicyDecision> {
-    apply_policy_net(
+    let decision = apply_policy_net(
         peer.prefix_set_at(afi_safi, InOut::Output),
         peer.policy_list_at(afi_safi, InOut::Output),
+        peer.unbound_policy(),
         peer.router_id,
         IpNet::V6(nlri.prefix),
         bgp_attr,
         weight,
         tag,
-    )
+    );
+    post_policy(decision, &peer.post_policy_filter(afi_safi))
 }
 
 /// Next-Hop Tracking for a received route: register its BGP next-hop
@@ -4557,7 +4605,7 @@ pub fn route_ipv4_update(
         let peer = peers.get_mut_by_idx(ident).expect("peer must exist");
         inbound_attr_checks(peer, attr, rd.is_none() && label.is_none())
     };
-    let Some((peer_ident, peer_router_id, typ, from_client, otc_stamped)) = checks else {
+    let Some((src, otc_stamped)) = checks else {
         // An RFC 9234 leak: the UPDATE replaces the neighbor's earlier
         // path for this prefix, so that path goes too. (This entry runs
         // without the shard pool, like the ingest below.)
@@ -4580,10 +4628,7 @@ pub fn route_ipv4_update(
         route_apply_policy_in(peer, afi_safi, nlri, attr.clone(), 0)
     };
     let jobs = route_ipv4_update_decided(
-        peer_ident,
-        peer_router_id,
-        typ,
-        from_client,
+        src,
         nlri,
         rd,
         label,
@@ -4596,8 +4641,19 @@ pub fn route_ipv4_update(
         stale,
     );
     for job in jobs {
-        apply_ipv4_advertise_job(job, peer_ident, BTreeMap::new(), bgp, peers);
+        apply_ipv4_advertise_job(job, src.ident, BTreeMap::new(), bgp, peers);
     }
+}
+
+/// What the per-prefix ingest of one UPDATE needs to know about the peer
+/// that sent it, read once per UPDATE.
+#[derive(Debug, Clone, Copy)]
+struct IngressPeer {
+    ident: usize,
+    router_id: Ipv4Addr,
+    typ: BgpRibType,
+    from_client: bool,
+    unbound_policy: super::policy::UnboundPolicy,
 }
 
 /// Per-attr inbound checks shared by every prefix in an UPDATE — the RFC
@@ -4611,7 +4667,7 @@ fn inbound_attr_checks(
     peer: &mut Peer,
     attr: &BgpAttr,
     otc_unicast: bool,
-) -> Option<(usize, Ipv4Addr, BgpRibType, bool, Option<BgpAttr>)> {
+) -> Option<(IngressPeer, Option<BgpAttr>)> {
     // RFC 9234 §5 ingress: a leak is ineligible, never stored — `None`,
     // on which the callers withdraw the neighbor's earlier path for the
     // prefix (the leaked UPDATE replaces it); IR3 hands back a stamped
@@ -4637,8 +4693,14 @@ fn inbound_attr_checks(
     } else {
         BgpRibType::EBGP
     };
-    let from_client = peer.is_ibgp() && peer.is_reflector_client();
-    Some((peer.ident, peer.remote_id, typ, from_client, otc_stamped))
+    let src = IngressPeer {
+        ident: peer.ident,
+        router_id: peer.remote_id,
+        typ,
+        from_client: peer.is_ibgp() && peer.is_reflector_client(),
+        unbound_policy: peer.unbound_policy(),
+    };
+    Some((src, otc_stamped))
 }
 
 /// Parallel ingest for a packet's plain IPv4-unicast NLRIs (RIB
@@ -4660,7 +4722,7 @@ pub fn route_ipv4_update_batch(
         let peer = peers.get_mut_by_idx(ident).expect("peer must exist");
         inbound_attr_checks(peer, attr, true)
     };
-    let Some((peer_ident, peer_router_id, typ, from_client, otc_stamped)) = checks else {
+    let Some((src, otc_stamped)) = checks else {
         // An RFC 9234 leak: the UPDATE replaces the neighbor's earlier
         // path for each prefix, so those paths go too.
         for nlri in prefixes {
@@ -4697,16 +4759,17 @@ pub fn route_ipv4_update_batch(
             pool.dispatch(
                 idx,
                 ShardMsg::RouteBatchV4(super::shard::msg::ShardRouteBatchV4 {
-                    ident: peer_ident,
-                    peer_router_id,
-                    typ,
-                    from_client,
+                    ident: src.ident,
+                    peer_router_id: src.router_id,
+                    typ: src.typ,
+                    from_client: src.from_client,
                     attr: shared.clone(),
                     nlris,
                     enhe_egress: None,
                     stale,
                     nexthop_reachable,
                     compute_policy: true,
+                    unbound_policy: src.unbound_policy,
                 }),
             );
         }
@@ -4726,12 +4789,12 @@ pub fn route_ipv4_update_batch(
         let nexthop_reachable =
             nht_track_received_attr(bgp, attr, super::nht::NhtDep::V4(nlri.prefix));
         let msg = ShardMsg::UpdateV4(ShardUpdateV4 {
-            ident: peer_ident,
+            ident: src.ident,
             rd: None,
             nlri: nlri.clone(),
-            peer_router_id,
-            typ,
-            from_client,
+            peer_router_id: src.router_id,
+            typ: src.typ,
+            from_client: src.from_client,
             attr: shared.clone(),
             label: None,
             nexthop: None,
@@ -4741,6 +4804,7 @@ pub fn route_ipv4_update_batch(
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: src.unbound_policy,
         });
         let deltas = bgp.shard.handle(msg);
         for delta in deltas {
@@ -4764,7 +4828,7 @@ pub fn route_ipv4_update_batch(
     // Phase C (serial): apply each job's advertise off the precomputed
     // outcomes; cache / adj-out / send mutate shared state in NLRI order.
     for (job, memo) in jobs.into_iter().zip(memos) {
-        apply_ipv4_advertise_job(job, peer_ident, memo, bgp, peers);
+        apply_ipv4_advertise_job(job, src.ident, memo, bgp, peers);
     }
 }
 
@@ -4916,10 +4980,7 @@ struct Ipv4AdvertiseJob {
 /// single-prefix and batch entry points.
 #[allow(clippy::too_many_arguments)]
 fn route_ipv4_update_decided(
-    peer_ident: usize,
-    peer_router_id: Ipv4Addr,
-    typ: BgpRibType,
-    from_client: bool,
+    src: IngressPeer,
     nlri: &Ipv4Nlri,
     rd: Option<RouteDistinguisher>,
     label: Option<Label>,
@@ -4954,12 +5015,12 @@ fn route_ipv4_update_decided(
             true
         };
         let msg = ShardMsg::UpdateV4(ShardUpdateV4 {
-            ident: peer_ident,
+            ident: src.ident,
             rd,
             nlri: nlri.clone(),
-            peer_router_id,
-            typ,
-            from_client,
+            peer_router_id: src.router_id,
+            typ: src.typ,
+            from_client: src.from_client,
             attr: Arc::new(attr.clone()),
             label,
             nexthop,
@@ -4969,6 +5030,7 @@ fn route_ipv4_update_decided(
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: src.unbound_policy,
         });
         pool.dispatch(pool.shard_of(std::net::IpAddr::V4(nlri.prefix.addr())), msg);
         return Vec::new();
@@ -4985,7 +5047,7 @@ fn route_ipv4_update_decided(
                 true
             };
             let transit = rd.is_some()
-                && peer_ident != ORIGINATED_PEER
+                && src.ident != ORIGINATED_PEER
                 && bgp.vrf_import.is_some_and(|disp| {
                     super::inst::rt_imported_by_hybrid_vrf_v4(disp.rib_known_vrfs, &d.attr.ecom)
                 });
@@ -4994,12 +5056,12 @@ fn route_ipv4_update_decided(
         None => (true, false, attr.clone()),
     };
     let msg = ShardMsg::UpdateV4(ShardUpdateV4 {
-        ident: peer_ident,
+        ident: src.ident,
         rd,
         nlri: nlri.clone(),
-        peer_router_id,
-        typ,
-        from_client,
+        peer_router_id: src.router_id,
+        typ: src.typ,
+        from_client: src.from_client,
         attr: Arc::new(attr.clone()),
         label,
         nexthop,
@@ -5009,6 +5071,7 @@ fn route_ipv4_update_decided(
         vrf_transit_only,
         decision,
         compute_policy: false,
+        unbound_policy: src.unbound_policy,
     });
     let deltas = bgp.shard.handle(msg);
 
@@ -8453,17 +8516,28 @@ fn route_soft_in_peer_table(
     // not only the policy verdict: the stored row's `from_client` is the
     // role at learn time, and a `route-reflector-client` change since
     // then would otherwise survive the replay.
-    let (ident, from_client) = {
+    let (ident, from_client, unbound_policy) = {
         let Some(peer) = peers.get_by_idx(peer_idx) else {
             return;
         };
-        (peer.ident, peer.is_ibgp() && peer.is_reflector_client())
+        (
+            peer.ident,
+            peer.is_ibgp() && peer.is_reflector_client(),
+            peer.unbound_policy(),
+        )
     };
     if rd.is_none()
         && let Some(pool) = shards
     {
         for idx in 0..pool.n() {
-            pool.dispatch(idx, ShardMsg::SoftInV4 { ident, from_client });
+            pool.dispatch(
+                idx,
+                ShardMsg::SoftInV4 {
+                    ident,
+                    from_client,
+                    unbound_policy,
+                },
+            );
         }
         return;
     }
@@ -13983,6 +14057,18 @@ fn withdraw_mp_reach(
     }
 }
 
+/// Count an UPDATE whose BGP Prefix-SID the parser dropped (RFC 8669 §4).
+/// Logged for the first one only, so a full table does not flood the log.
+fn note_prefix_sid_discarded(peer: &mut Peer) {
+    if peer.prefix_sid_discarded == 0 {
+        tracing::debug!(
+            peer = %peer.display_name(),
+            "bgp: discarding the BGP Prefix-SID received from an external neighbor (RFC 8669 §4)",
+        );
+    }
+    peer.prefix_sid_discarded += 1;
+}
+
 pub fn route_from_peer(
     peer_id: usize,
     mut packet: UpdatePacket,
@@ -13997,6 +14083,11 @@ pub fn route_from_peer(
             withdraws = packet.ipv4_withdraw.len(),
             "recv UPDATE NLRI"
         );
+    }
+    if packet.prefix_sid_discarded
+        && let Some(peer) = peers.get_mut_by_idx(peer_id)
+    {
+        note_prefix_sid_discarded(peer);
     }
     // enforce-first-as (RFC 4271 §6.3's optional first-AS check), judged
     // on the AS_PATH the neighbor sent: before the `local-as` ingress
@@ -15585,6 +15676,19 @@ fn strip_ibgp_only_attrs(attrs: &mut BgpAttr) {
     attrs.local_pref = None;
 }
 
+/// The AS-boundary rule for the BGP Prefix-SID (RFC 8669 §5.1, RFC 9252
+/// §9.2): a plain-unicast route sent to an external neighbor keeps the
+/// attribute only when that neighbor is set up to receive it
+/// ([`Peer::prefix_sid_send`]). VPN routes are not plain unicast: their
+/// SID is the service the session carries.
+fn prefix_sid_crosses_boundary(
+    peer_type: PeerType,
+    plain_unicast: bool,
+    prefix_sid_send: bool,
+) -> bool {
+    !(peer_type.is_ebgp() && plain_unicast) || prefix_sid_send
+}
+
 pub fn route_update_ipv4(
     ctx: &SyncCtx,
     prefix: &Ipv4Net,
@@ -15763,6 +15867,9 @@ pub fn route_update_ipv4(
     if ctx.peer_type.is_ebgp() {
         strip_ibgp_only_attrs(&mut attrs);
     }
+    if !prefix_sid_crosses_boundary(ctx.peer_type, rib.nexthop.is_none(), ctx.prefix_sid_send) {
+        attrs.prefix_sid = None;
+    }
 
     // Debug/test knob: attach a synthetic unrecognized path attribute on
     // egress (RFC 4271 §9 origination test). Done last so the configured
@@ -15936,16 +16043,25 @@ pub fn route_update_ipv6(
         }
     }
 
-    // Don't leak a *relayed* SRv6 L3 Service SID onto a plain v6-unicast
-    // advertisement to a non-SRv6 peer. The SID is a provider-side
-    // construct: when a PE imports a VPNv6 route into a VRF (carrying the
-    // remote PE's End.DT46 service SID) and re-advertises it to a plain
-    // eBGP CE, the route keeps that SID in its Prefix-SID attribute.
-    // Leaking it to a non-SRv6 CE is fatal — `nht_target` prefers the SID
-    // over the BGP next-hop, so the CE tracks the unresolvable provider
-    // locator, the route never becomes reachable, and it is never
-    // re-advertised onward toward the customer site. Strip the Prefix-SID
-    // attribute when ALL hold:
+    if !prefix_sid_crosses_boundary(
+        peer.peer_type,
+        plain_unicast,
+        peer.prefix_sid_send(Afi::Ip6),
+    ) {
+        attrs.prefix_sid = None;
+    }
+    // Inside the AS, don't leak a *relayed* SRv6 L3 Service SID onto a
+    // plain v6-unicast advertisement to a non-SRv6 peer. The SID is a
+    // provider-side construct: when a PE imports a VPNv6 route into a VRF
+    // (carrying the remote PE's End.DT46 service SID) and re-advertises it
+    // to a plain iBGP CE, the route keeps that SID in its Prefix-SID
+    // attribute. Leaking it to a non-SRv6 CE is fatal — `nht_target`
+    // prefers the SID over the BGP next-hop, so the CE tracks the
+    // unresolvable provider locator, the route never becomes reachable,
+    // and it is never re-advertised onward toward the customer site.
+    // External peers follow `prefix_sid_crosses_boundary` above. Strip the
+    // Prefix-SID attribute when ALL hold:
+    //   - the peer is internal;
     //   - this speaker does not originate SRv6 IPv6-unicast service
     //     (`srv6_ipv6_export` is `None`) — a node advertising its OWN
     //     SRv6 service SID (e.g. `redistribute` under a local locator with
@@ -15956,7 +16072,8 @@ pub fn route_update_ipv6(
     //     encapsulation-type srv6[-relax]`);
     //   - the advertisement is plain v6-unicast (a bare IPv6 next-hop, not
     //     a VPNv6 next-hop).
-    if bgp.srv6_ipv6_export.is_none()
+    if peer.is_ibgp()
+        && bgp.srv6_ipv6_export.is_none()
         && peer.ipv6_srv6_encap().is_none()
         && matches!(attrs.nexthop, Some(BgpNexthop::Ipv6(_)))
         && attrs.srv6_l3_sid().is_some()
@@ -17695,14 +17812,16 @@ fn entry_matches_evpn(
     true
 }
 
-/// Apply a `set community <community-set> [additive]` action to `bgp_attr`.
+/// Apply a `set community <community-set> [additive|delete]` action to
+/// `bgp_attr`.
 ///
-/// Only `Standard::Exact` matchers contribute concrete values; regex and
-/// extended-community matchers are skipped (extended communities live in
-/// a separate BGP attribute, and regex patterns are not concrete values).
-/// With `additive = false` the existing community list is replaced; with
-/// `additive = true` the new values are merged in. The result is always
-/// sorted and deduplicated.
+/// Replace and additive use only the `Standard::Exact` matchers, the
+/// concrete values; regex, `*` pattern and extended-community matchers are
+/// skipped (extended communities live in a separate BGP attribute). With
+/// replace the existing community list is replaced; with additive the new
+/// values are merged in. Delete removes every value that any standard
+/// member matches, so `64500:*` removes all of AS 64500's communities. The
+/// result is always sorted and deduplicated.
 fn apply_set_community(bgp_attr: &mut BgpAttr, cfg: &crate::policy::SetCommunityConfig) {
     // Unresolved name (community-set was deleted or never defined):
     // skip silently rather than touch the attribute. policy_entry_sync
@@ -17736,13 +17855,12 @@ fn apply_set_community(bgp_attr: &mut BgpAttr, cfg: &crate::policy::SetCommunity
             bgp_attr.com = Some(com);
         }
         SetCommunityMode::Delete => {
-            // Set difference: drop matching values from existing
-            // community attribute. No-op if attribute absent.
+            // Drop the values a member matches from the existing community
+            // attribute. No-op if attribute absent.
             let Some(mut com) = bgp_attr.com.clone() else {
                 return;
             };
-            let drop: std::collections::HashSet<u32> = new_vals.into_iter().collect();
-            com.0.retain(|v| !drop.contains(v));
+            com.0.retain(|v| !set.has_standard(*v));
             bgp_attr.com = if com.0.is_empty() { None } else { Some(com) };
         }
     }
@@ -17797,9 +17915,10 @@ fn apply_set_ext_community(bgp_attr: &mut BgpAttr, cfg: &crate::policy::SetExtCo
 
 /// Apply a `set large-community <large-community-set> [additive|delete]`
 /// action to `bgp_attr`. The large-community twin of
-/// [`apply_set_community`]: only `Exact` `A:B:C` matchers contribute
-/// concrete values; regex matchers are skipped. `Replace` overwrites
-/// the LARGE_COMMUNITIES attribute, `Additive` merges, `Delete` removes.
+/// [`apply_set_community`]: `Replace` overwrites the LARGE_COMMUNITIES
+/// attribute and `Additive` merges, both with only the `Exact` `A:B:C`
+/// matchers; `Delete` removes every value any member matches, `*`
+/// patterns and regexes included.
 fn apply_set_large_community(bgp_attr: &mut BgpAttr, cfg: &crate::policy::SetLargeCommunityConfig) {
     let Some(set) = cfg.resolved.as_ref() else {
         return;
@@ -17833,7 +17952,7 @@ fn apply_set_large_community(bgp_attr: &mut BgpAttr, cfg: &crate::policy::SetLar
             let Some(mut lcom) = bgp_attr.lcom.clone() else {
                 return;
             };
-            lcom.0.retain(|v| !new_vals.contains(v));
+            lcom.0.retain(|v| !set.has(v));
             bgp_attr.lcom = if lcom.0.is_empty() { None } else { Some(lcom) };
         }
     }
@@ -28962,6 +29081,53 @@ mod tests {
         assert!(out.com.is_none());
     }
 
+    #[test]
+    fn policy_list_apply_community_delete_by_pattern_keeps_other_values() {
+        let mut list = PolicyList::default();
+        list.entry(10).set_community = Some(set_community_cfg(
+            &["64500:*", "*:1001"],
+            SetCommunityMode::Delete,
+        ));
+        let attr = BgpAttr {
+            com: Some(Community::from([
+                com_val("64500:1"),
+                com_val("64500:2"),
+                com_val("65000:1001"),
+                com_val("65000:7"),
+                com_val("1:64500"),
+            ])),
+            ..Default::default()
+        };
+        let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), attr).unwrap();
+        assert_eq!(
+            out.com,
+            Some(Community::from([com_val("1:64500"), com_val("65000:7")]))
+        );
+    }
+
+    #[test]
+    fn policy_list_apply_community_delete_by_regex_member() {
+        let mut list = PolicyList::default();
+        list.entry(10).set_community =
+            Some(set_community_cfg(&["^65000:.*$"], SetCommunityMode::Delete));
+        let attr = BgpAttr {
+            com: Some(Community::from([com_val("65000:1"), com_val("65001:1")])),
+            ..Default::default()
+        };
+        let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), attr).unwrap();
+        assert_eq!(out.com, Some(Community::from([com_val("65001:1")])));
+    }
+
+    #[test]
+    fn policy_list_apply_community_replace_and_additive_skip_wildcards() {
+        for mode in [SetCommunityMode::Replace, SetCommunityMode::Additive] {
+            let mut list = PolicyList::default();
+            list.entry(10).set_community = Some(set_community_cfg(&["100:200", "64500:*"], mode));
+            let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), BgpAttr::default()).unwrap();
+            assert_eq!(out.com, Some(Community::from([com_val("100:200")])));
+        }
+    }
+
     // --- set ext-community -----------------------------------------------
 
     fn ext_community_set(members: &[&str]) -> ExtCommunitySet {
@@ -29141,6 +29307,42 @@ mod tests {
         };
         let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), attr).unwrap();
         assert!(out.lcom.is_none());
+    }
+
+    #[test]
+    fn policy_list_apply_large_community_delete_by_field_wildcard() {
+        let mut list = PolicyList::default();
+        list.entry(10).set_large_community = Some(set_large_community_cfg(
+            &["64500:*:*", "*:1:*"],
+            SetCommunityMode::Delete,
+        ));
+        let attr = BgpAttr {
+            lcom: Some(LargeCommunity::from_iter([
+                lc_val("64500:9:9"),
+                lc_val("65000:1:5"),
+                lc_val("65000:2:5"),
+            ])),
+            ..Default::default()
+        };
+        let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), attr).unwrap();
+        assert_eq!(
+            out.lcom,
+            Some(LargeCommunity::from_iter([lc_val("65000:2:5")]))
+        );
+    }
+
+    #[test]
+    fn policy_list_apply_large_community_replace_skips_wildcards() {
+        let mut list = PolicyList::default();
+        list.entry(10).set_large_community = Some(set_large_community_cfg(
+            &["65001:100:200", "64500:*:*"],
+            SetCommunityMode::Replace,
+        ));
+        let out = policy_list_apply(&list, &nlri("10.0.0.0/24"), BgpAttr::default()).unwrap();
+        assert_eq!(
+            out.lcom,
+            Some(LargeCommunity::from_iter([lc_val("65001:100:200")]))
+        );
     }
 
     #[test]
@@ -34089,6 +34291,9 @@ mod as_sets_withdraw_tests {
                 route_server_client: false,
             },
             out_policy: Arc::new(crate::bgp::policy::OutPolicy::default()),
+            out_unbound: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             packet_tx: None,
             egress_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extended_message: false,
@@ -34149,6 +34354,9 @@ mod as_sets_withdraw_tests {
                 route_server_client: false,
             },
             out_policy: Arc::new(crate::bgp::policy::OutPolicy::default()),
+            out_unbound: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             packet_tx: None,
             egress_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extended_message: false,
@@ -34242,6 +34450,9 @@ mod as_sets_withdraw_tests {
                 route_server_client: false,
             },
             out_policy: Arc::new(crate::bgp::policy::OutPolicy::default()),
+            out_unbound: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             packet_tx: None,
             egress_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extended_message: false,
@@ -34313,6 +34524,9 @@ mod as_sets_withdraw_tests {
                 route_server_client: false,
             },
             out_policy: Arc::new(crate::bgp::policy::OutPolicy::default()),
+            out_unbound: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             packet_tx: None,
             egress_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             extended_message: false,
@@ -38150,6 +38364,10 @@ mod update_group_next_hop_knob_tests {
 #[cfg(test)]
 #[path = "bgpls_review_tests.rs"]
 mod bgpls_review_tests;
+
+#[cfg(test)]
+#[path = "ebgp_boundary_tests.rs"]
+mod ebgp_boundary_tests;
 
 #[cfg(test)]
 mod vxlan_type5_tests {

@@ -34,6 +34,10 @@ router:
       afi-safi:
       - name: ipv6
         enabled: true
+        # z2 is external, so the SID crosses only when opened here
+        # (RFC 8669 section 5.1, RFC 9252 section 9.2).
+        prefix-sid:
+          send: true
     afi-safi:
     - name: ipv6
       redistribute:

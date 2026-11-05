@@ -140,6 +140,10 @@ pub struct BgpVrf {
     /// originating VRF is excluded) and by eBGP AS-path. Off by default,
     /// so non-hybrid VRF behaviour is unchanged.
     pub inter_as_hybrid: bool,
+    /// `ebgp-requires-policy` of this VRF (RFC 8212). Seeded at spawn
+    /// and onto each CE peer as it is built; updated in place by
+    /// [`BgpVrfMsg::EbgpRequiresPolicy`].
+    pub ebgp_requires_policy: super::super::policy::EbgpRequiresPolicy,
     /// Dedup pool for `BgpAttr` instances seen by this VRF's
     /// peers. Every per-VRF runtime gets its own pool (cheaper
     /// than threading a shared lock across the `!Send` boundary,
@@ -385,17 +389,15 @@ pub struct VrfExporter {
 /// "no per-VRF label allocated" — the global handler treats it as
 /// "skip the per-route install" rather than emit an
 /// explicit-null label.
-/// Drop every Route-Target extended community (RFC 4360 sub-type 0x02)
-/// from a clone of `attr`. Used on the Inter-AS Option AB re-export path:
+/// Drop every Route Target (RFC 4360, RFC 5668, RFC 5701) from a clone
+/// of `attr`. Used on the Inter-AS Option AB re-export path:
 /// a route imported into a hybrid VRF carries the RTs it matched on, but
 /// the re-originated route must carry only *this* VRF's export RTs (the
 /// global Export handler re-tags). Without the strip the same RT would
 /// accumulate one copy per inter-AS hop.
 fn attr_without_route_targets(attr: &bgp_packet::BgpAttr) -> bgp_packet::BgpAttr {
     let mut a = attr.clone();
-    if let Some(ref mut ecom) = a.ecom {
-        ecom.0.retain(|v| v.low_type != 0x02);
-    }
+    a.remove_route_targets();
     a
 }
 
@@ -924,6 +926,7 @@ impl BgpVrf {
             label,
             // Default off; `spawn_bgp_vrf` sets it from the VRF config.
             inter_as_hybrid: false,
+            ebgp_requires_policy: Default::default(),
             attr_store: BgpAttrStore::new(),
             update_groups: super::super::update_group::empty_map(),
             interface_addrs: InterfaceAddrs::new(),
@@ -1784,6 +1787,29 @@ impl BgpVrf {
             InOut::Output => {
                 super::super::route::route_soft_out_peer(peer_idx, &mut top, &mut self.peers);
             }
+        }
+    }
+
+    /// Apply a new `ebgp-requires-policy` to every CE peer. A peer whose
+    /// verdict changed re-runs its inbound and outbound policy; no session
+    /// is reset.
+    pub(super) fn set_ebgp_requires_policy(
+        &mut self,
+        value: super::super::policy::EbgpRequiresPolicy,
+    ) {
+        use super::super::policy::InOut;
+        self.ebgp_requires_policy = value;
+        let mut changed = Vec::new();
+        for (_, peer) in self.peers.iter_mut_all() {
+            let before = peer.unbound_policy();
+            peer.ebgp_requires_policy = value;
+            if peer.unbound_policy() != before {
+                changed.push(peer.ident);
+            }
+        }
+        for ident in changed {
+            self.soft_reapply_peer(ident, InOut::Input);
+            self.soft_reapply_peer(ident, InOut::Output);
         }
     }
 
@@ -3706,6 +3732,7 @@ impl BgpVrf {
         // change.
         let before_mp: std::collections::BTreeSet<bgp_packet::AfiSafi> =
             peer.config.mp.0.keys().copied().collect();
+        let before_filters = peer.attr_filter_config();
         peer.remote_as = remote_as;
         peer.peer_type = if remote_as == self.asn {
             PeerType::IBGP
@@ -3721,6 +3748,9 @@ impl BgpVrf {
         let after_mp: std::collections::BTreeSet<bgp_packet::AfiSafi> =
             peer.config.mp.0.keys().copied().collect();
         bounce |= before_mp != after_mp && peer.state.is_established();
+        // Unlike next-hop-self, these knobs change what was already sent,
+        // so the peer is re-synced instead of waiting for the next route.
+        let resync_out = !bounce && peer.attr_filter_config() != before_filters;
         // The TCP-AO key-chain binding after the config swap (set by
         // `apply_resolved_session_knobs`'s `apply_ao_config`).
         let new_ao_chain = peer
@@ -3741,6 +3771,9 @@ impl BgpVrf {
         // new set. Done after the config swap (which does NOT touch the
         // resolved slots — those live on `Peer`, not `PeerConfig`).
         self.rebind_policy_refs(&addr, policy_refs, &old_watches);
+        if resync_out {
+            self.soft_reapply_peer(ident, super::super::policy::InOut::Output);
+        }
 
         if bounce {
             // Bounce through the FSM event channel, exactly like the
@@ -3901,6 +3934,7 @@ impl BgpVrf {
                 // logging switch — nothing to re-run.
                 self.tracing = tracing;
             }
+            BgpVrfMsg::EbgpRequiresPolicy(value) => self.set_ebgp_requires_policy(value),
             BgpVrfMsg::MupSegmentCatalog(catalog) => {
                 // The interwork/direct segment associations moved (or this
                 // is the post-spawn seed). Re-derive the GTP datapath —
@@ -6066,6 +6100,7 @@ mod tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: false,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
         assert_eq!(
             vrf.shard.adj_in(peer_idx).unwrap().v4.0.len(),
@@ -6104,6 +6139,147 @@ mod tests {
                 .is_established(),
             "the CE session stayed Established across the policy edit"
         );
+    }
+
+    /// RFC 8212: an `ebgp-requires-policy` change reaches a running VRF
+    /// task in place. An Established eBGP CE with no policy re-runs its
+    /// inbound policy, so its received route enters (knob off) and leaves
+    /// (knob on) the Loc-RIB, and the session stays up.
+    #[tokio::test]
+    async fn ebgp_requires_policy_change_reapplies_ce_policy_in_place() {
+        use crate::bgp::peer::{Peer, State};
+        use crate::bgp::policy::{EbgpRequiresPolicy, UnboundPolicy};
+        use crate::bgp::route::BgpRibType;
+        use crate::bgp::shard::msg::{ShardMsg, ShardUpdateV4};
+        use bgp_packet::{Afi, BgpAttr, BgpNexthop, CapMultiProtocol, Ipv4Nlri, Safi};
+        use std::net::IpAddr;
+
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(51, "vrf-rfc8212");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-rfc8212".to_string(),
+            ctx,
+            Ipv4Addr::UNSPECIFIED,
+            65000,
+            /* label */ 16,
+            global_tx,
+            rib_rx,
+        );
+        assert_eq!(vrf.ebgp_requires_policy, EbgpRequiresPolicy(false));
+
+        let addr: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
+        let (peer_tx, _peer_rx) = mpsc::channel::<Message>(4);
+        let mut peer = Peer::new(
+            0,
+            65000,
+            Ipv4Addr::new(1, 1, 1, 1),
+            65001,
+            addr,
+            None,
+            peer_tx,
+            test_ctx_for_vrf(51, "vrf-rfc8212"),
+        );
+        peer.state = State::Established;
+        peer.peer_type = crate::bgp::peer::PeerType::EBGP;
+        let key = CapMultiProtocol::new(&Afi::Ip, &Safi::Unicast);
+        let entry = peer.cap_map.entries.get_mut(&key).expect("pre-seeded");
+        entry.send = true;
+        entry.recv = true;
+        vrf.peers.insert(addr, peer);
+        let peer_idx = vrf.peers.get(&addr).unwrap().ident;
+        vrf.set_ebgp_requires_policy(EbgpRequiresPolicy(true));
+        assert_eq!(
+            vrf.peers.get(&addr).unwrap().ebgp_requires_policy,
+            EbgpRequiresPolicy(true)
+        );
+
+        let prefix: ipnet::Ipv4Net = "10.9.0.0/24".parse().unwrap();
+        let attr = BgpAttr {
+            nexthop: Some(BgpNexthop::Ipv4("10.0.0.2".parse().unwrap())),
+            ..Default::default()
+        };
+        vrf.shard.handle(ShardMsg::UpdateV4(ShardUpdateV4 {
+            ident: peer_idx,
+            rd: None,
+            nlri: Ipv4Nlri { id: 0, prefix },
+            peer_router_id: Ipv4Addr::new(10, 0, 0, 2),
+            typ: BgpRibType::EBGP,
+            from_client: false,
+            attr: std::sync::Arc::new(attr),
+            label: None,
+            nexthop: None,
+            enhe_egress: None,
+            stale: false,
+            nexthop_reachable: true,
+            vrf_transit_only: false,
+            decision: None,
+            compute_policy: true,
+            unbound_policy: UnboundPolicy::Deny,
+        }));
+        assert!(
+            vrf.shard.v4.0.is_empty(),
+            "RFC 8212 kept it out of the Loc-RIB"
+        );
+
+        vrf.set_ebgp_requires_policy(EbgpRequiresPolicy(false));
+        assert_eq!(
+            vrf.peers.get(&addr).unwrap().ebgp_requires_policy,
+            EbgpRequiresPolicy(false)
+        );
+        assert_eq!(vrf.shard.v4.0.len(), 1, "the replay accepts the route");
+
+        vrf.set_ebgp_requires_policy(EbgpRequiresPolicy(true));
+        assert!(vrf.shard.v4.0.is_empty(), "the replay denies it again");
+        assert_eq!(
+            vrf.shard.adj_in(peer_idx).unwrap().v4.0.len(),
+            1,
+            "the route stays in the Adj-RIB-In"
+        );
+        assert!(vrf.peers.get(&addr).unwrap().state.is_established());
+    }
+
+    /// A CE peer is built as a VRF-instance peer with the VRF's
+    /// `ebgp-requires-policy`, so it is sent no Route Target and RFC 8212
+    /// follows the VRF's own knob.
+    #[tokio::test]
+    async fn insert_started_peer_builds_a_vrf_instance_peer() {
+        use crate::bgp::peer::PeerInstance;
+        use crate::bgp::policy::EbgpRequiresPolicy;
+        let (global_tx, _global_rx) = unbounded_channel::<BgpGlobalMsg>();
+        let ctx = test_ctx_for_vrf(55, "vrf-instance");
+        let (_rib_tx, rib_rx) = mpsc::unbounded_channel();
+        let (mut vrf, _inbox) = BgpVrf::new(
+            "vrf-instance".to_string(),
+            ctx,
+            Ipv4Addr::UNSPECIFIED,
+            65000,
+            /* label */ 16,
+            global_tx,
+            rib_rx,
+        );
+        vrf.ebgp_requires_policy = EbgpRequiresPolicy(true);
+        let a: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let (remote_as, config, knobs) = super::super::spawn::resolve_vrf_peer_config(
+            &a,
+            &crate::bgp::vrf_config::BgpVrfNeighborConfig {
+                remote_as: Some(65001),
+                ..Default::default()
+            },
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("neighbor with remote-as resolves");
+        super::super::spawn::insert_started_peer(
+            &mut vrf,
+            &a,
+            remote_as,
+            config,
+            &knobs,
+            &std::collections::BTreeMap::new(),
+        );
+        let peer = vrf.peers.get(&a).expect("peer inserted");
+        assert_eq!(peer.instance, PeerInstance::Vrf);
+        assert_eq!(peer.ebgp_requires_policy, EbgpRequiresPolicy(true));
     }
 
     /// Editing an inbound prefix-set to **deny** a CE route that was
@@ -6190,6 +6366,7 @@ mod tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: false,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
 
         // Resolve the inbound set to PERMIT so the route lands in Loc-RIB

@@ -346,6 +346,7 @@ pub fn spawn_bgp_vrf(
     // Inter-AS Option AB: re-export imported VPNv4 routes (see the field
     // doc on `BgpVrf`). Carried from the staged VRF config.
     vrf.inter_as_hybrid = cfg.inter_as_hybrid;
+    vrf.ebgp_requires_policy = cfg.ebgp_requires_policy;
     // The VRF's RD scopes its per-VRF MUP RIB to its own RD (imported MUP
     // routes are re-keyed under it, not their origin RD). Captured at spawn
     // like router-id; an `rd` edit on a live VRF doesn't re-key the running
@@ -694,6 +695,8 @@ pub(super) fn insert_started_peer(
     // priority lane, not the `tx` lane a CE ingest burst backs up —
     // the per-VRF mirror of the global instance's `ptx` wiring.
     peer.ptx = vrf.ptx.clone();
+    peer.instance = super::super::peer::PeerInstance::Vrf;
+    peer.ebgp_requires_policy = vrf.ebgp_requires_policy;
     // `Peer::new` defaults `peer_type` to IBGP and, unlike the global
     // `config_remote_as` path, nothing else recomputes it for a VRF
     // peer — so derive it here from the AS comparison. Without this a

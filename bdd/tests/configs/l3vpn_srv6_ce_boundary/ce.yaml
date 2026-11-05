@@ -1,0 +1,30 @@
+# ce — customer edge (AS 65100) with an IPv4 and an IPv6 eBGP session to b.
+# The Prefix-SID accept knob stays at its default (off).
+interface:
+- if-name: t-b
+  ipv4:
+    address: 10.1.0.2/30
+  ipv6:
+    address: 2001:db8:1e::2/64
+router:
+  bgp:
+    global:
+      as: 65100
+      router-id: 10.1.0.2
+    neighbor:
+    - remote-address: 10.1.0.1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    - remote-address: 2001:db8:1e::1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv6
+        enabled: true

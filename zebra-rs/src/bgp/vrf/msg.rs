@@ -299,6 +299,11 @@ pub enum BgpVrfMsg {
     /// task never runs a single event with a stale snapshot.
     Tracing(crate::bgp::tracing::BgpTracing),
 
+    /// The VRF's `ebgp-requires-policy` (RFC 8212) changed in a commit.
+    /// The task applies it in place: every CE peer whose verdict changed
+    /// re-runs its policies, and no session is reset.
+    EbgpRequiresPolicy(crate::bgp::policy::EbgpRequiresPolicy),
+
     /// Refresh the config-derived MUP segment catalog (which VRFs are
     /// interwork / direct segments, with their kernel tables). The global
     /// task seeds it right after spawn and re-broadcasts diff-gated

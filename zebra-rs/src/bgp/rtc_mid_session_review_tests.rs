@@ -434,13 +434,16 @@ fn check_withdraw_reads_the_rt_sent(vpn: AfiSafi, prefix: &str) {
     session_up(&mut bgp, c, vpn, &[M::Rt(RT_A), M::Rt(RT_B)], &mut rc);
     let mut policy = PolicyList::default();
     policy.entry(10).action = PolicyAction::Permit;
-    let mut setter = SetExtCommunityConfig::new("rewrite-rt".into());
-    setter.resolved = Some(ExtCommunitySet {
-        vals: [ExtCommunityMatcher::Exact(rt_value(RT_B))]
-            .into_iter()
-            .collect(),
+    let setter = SetExtCommunityConfig {
+        name: "rewrite-rt".into(),
+        resolved: Some(ExtCommunitySet {
+            vals: [ExtCommunityMatcher::Exact(rt_value(RT_B))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
     policy.entry(10).set_ext_community = Some(setter);
     {
         let output = &mut bgp

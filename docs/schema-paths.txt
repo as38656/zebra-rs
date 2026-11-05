@@ -90,6 +90,7 @@
 /router/bgp/dynamic-neighbors/listen-limit	leaf
 /router/bgp/dynamic-neighbors/listen-range	list keys=prefix
 /router/bgp/dynamic-neighbors/listen-range/neighbor-group	leaf
+/router/bgp/ebgp-requires-policy	leaf
 /router/bgp/fast-external-failover	leaf
 /router/bgp/global	p-container
 /router/bgp/global/as	leaf
@@ -178,6 +179,13 @@
 /router/bgp/neighbor/afi-safi/prefix-set	container
 /router/bgp/neighbor/afi-safi/prefix-set/in	leaf
 /router/bgp/neighbor/afi-safi/prefix-set/out	leaf
+/router/bgp/neighbor/afi-safi/prefix-sid	container
+/router/bgp/neighbor/afi-safi/prefix-sid/accept	leaf
+/router/bgp/neighbor/afi-safi/prefix-sid/send	leaf
+/router/bgp/neighbor/afi-safi/send-community	container
+/router/bgp/neighbor/afi-safi/send-community/extended	leaf
+/router/bgp/neighbor/afi-safi/send-community/large	leaf
+/router/bgp/neighbor/afi-safi/send-community/standard	leaf
 /router/bgp/neighbor/allowas-in	p-container
 /router/bgp/neighbor/allowas-in/count	leaf
 /router/bgp/neighbor/allowas-in/origin	leaf
@@ -350,6 +358,7 @@
 /router/bgp/vrf/afi-safi/mup/segment/lookup-network-instance	leaf
 /router/bgp/vrf/afi-safi/mup/segment/mup-ext-comm	leaf
 /router/bgp/vrf/afi-safi/mup/segment/prefix	leaf
+/router/bgp/vrf/ebgp-requires-policy	leaf
 /router/bgp/vrf/encapsulation	leaf
 /router/bgp/vrf/evpn	container
 /router/bgp/vrf/evpn/advertise-ipv4	leaf
@@ -376,6 +385,13 @@
 /router/bgp/vrf/neighbor/afi-safi/prefix-set	container
 /router/bgp/vrf/neighbor/afi-safi/prefix-set/in	leaf
 /router/bgp/vrf/neighbor/afi-safi/prefix-set/out	leaf
+/router/bgp/vrf/neighbor/afi-safi/prefix-sid	container
+/router/bgp/vrf/neighbor/afi-safi/prefix-sid/accept	leaf
+/router/bgp/vrf/neighbor/afi-safi/prefix-sid/send	leaf
+/router/bgp/vrf/neighbor/afi-safi/send-community	container
+/router/bgp/vrf/neighbor/afi-safi/send-community/extended	leaf
+/router/bgp/vrf/neighbor/afi-safi/send-community/large	leaf
+/router/bgp/vrf/neighbor/afi-safi/send-community/standard	leaf
 /router/bgp/vrf/neighbor/allowas-in	p-container
 /router/bgp/vrf/neighbor/allowas-in/count	leaf
 /router/bgp/vrf/neighbor/allowas-in/origin	leaf

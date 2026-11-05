@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nom::combinator::peek;
 use nom_derive::*;
@@ -32,6 +32,10 @@ pub struct ParseOption {
     /// Internal or external session. Derived from configuration (remote
     /// AS versus local AS), not negotiated, so `clear` leaves it alone.
     pub peer_type: BgpPeerType,
+    /// Address families whose BGP Prefix-SID attribute is discarded when
+    /// it arrives over an external session (RFC 8669 §4). Configuration,
+    /// so `clear` leaves it alone too.
+    pub prefix_sid_discard: BTreeSet<AfiSafi>,
 }
 
 impl ParseOption {

@@ -400,6 +400,10 @@ pub struct BgpVrfConfig {
     /// its own PEs over a single MP-eBGP VPNv4 session while still
     /// forwarding per-VRF. Default `false` (ordinary L3VPN VRF).
     pub inter_as_hybrid: bool,
+    /// `ebgp-requires-policy` (RFC 8212) for this VRF's CE peers. Not a
+    /// task-global input of [`runtime_structure_eq`]: a running task
+    /// applies a change in place (`BgpVrfMsg::EbgpRequiresPolicy`).
+    pub ebgp_requires_policy: super::policy::EbgpRequiresPolicy,
     /// Per-VRF BGP MUP (draft-ietf-bess-mup-safi) service config. Mirrors the
     /// `mup` container in zebra-bgp-vrf.yang.
     pub mobile_uplane: BgpVrfMobileUplane,
@@ -538,6 +542,19 @@ pub fn config_vrf_inter_as_hybrid(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -
         ConfigOp::Delete => cfg.inter_as_hybrid = false,
         _ => {}
     }
+    Some(())
+}
+
+/// `set router bgp vrf <NAME> ebgp-requires-policy <BOOL>` (RFC 8212).
+/// Delete restores the default.
+pub fn config_vrf_ebgp_requires_policy(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
+    let name = args.string()?;
+    let cfg = vrf_entry(bgp, name, op)?;
+    cfg.ebgp_requires_policy = if op.is_set() {
+        super::policy::EbgpRequiresPolicy(args.boolean()?)
+    } else {
+        super::policy::EbgpRequiresPolicy::default()
+    };
     Some(())
 }
 
@@ -1491,6 +1508,26 @@ vrf_afi_knob! {
 vrf_afi_knob! {
     /// `… afi-safi <af> encapsulation-type <srv6|srv6-relax>`.
     config_vrf_neighbor_afi_safi_encapsulation_type => set_encapsulation_type
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> prefix-sid send <bool>` (RFC 8669 §5.1).
+    config_vrf_neighbor_afi_safi_prefix_sid_send => set_prefix_sid_send
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> prefix-sid accept <bool>` (RFC 8669 §4).
+    config_vrf_neighbor_afi_safi_prefix_sid_accept => set_prefix_sid_accept
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> send-community standard <bool>`.
+    config_vrf_neighbor_afi_safi_send_community_standard => set_send_community_standard
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> send-community extended <bool>`.
+    config_vrf_neighbor_afi_safi_send_community_extended => set_send_community_extended
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> send-community large <bool>`.
+    config_vrf_neighbor_afi_safi_send_community_large => set_send_community_large
 }
 vrf_afi_knob! {
     /// `… afi-safi <af> next-hop-self <bool>`.

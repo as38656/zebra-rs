@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use bgp_packet::BgpAttr;
+use bgp_packet::{BgpAttr, LargeCommunityValue};
 
 use super::{LargeCommunityMatcher, match_large_community_set};
 
@@ -15,5 +15,10 @@ impl LargeCommunitySet {
         self.vals
             .iter()
             .any(|m| match_large_community_set(m, bgp_attr))
+    }
+
+    /// Whether the large community `value` matches a member.
+    pub fn has(&self, value: &LargeCommunityValue) -> bool {
+        self.vals.iter().any(|m| m.matches(value))
     }
 }

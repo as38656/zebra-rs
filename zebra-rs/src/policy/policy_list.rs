@@ -187,8 +187,8 @@ impl NumericSet {
 
 /// Operation applied by `set community NAME {|additive|delete}`.
 /// `Replace` overwrites the COMMUNITIES attribute with the set's
-/// members; `Additive` merges them in; `Delete` removes them
-/// (set difference).
+/// exact members; `Additive` merges them in; `Delete` removes every
+/// value that a member matches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SetCommunityMode {
     #[default]
@@ -200,21 +200,11 @@ pub enum SetCommunityMode {
 /// Set-action config for `set community NAME {|additive|delete}`.
 /// `name` references a community-set; `resolved` is populated by
 /// `policy_entry_sync` from the community-set registry.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SetCommunityConfig {
     pub name: String,
     pub mode: SetCommunityMode,
     pub resolved: Option<CommunitySet>,
-}
-
-impl SetCommunityConfig {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            mode: SetCommunityMode::Replace,
-            resolved: None,
-        }
-    }
 }
 
 /// Set-action config for `set ext-community NAME {|additive|delete}`.
@@ -222,42 +212,22 @@ impl SetCommunityConfig {
 /// `policy_entry_sync` from the ext-community-set registry. Reuses
 /// [`SetCommunityMode`]: replace overwrites the EXT_COMMUNITIES
 /// attribute with the set's members, additive merges, delete removes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SetExtCommunityConfig {
     pub name: String,
     pub mode: SetCommunityMode,
     pub resolved: Option<ExtCommunitySet>,
 }
 
-impl SetExtCommunityConfig {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            mode: SetCommunityMode::Replace,
-            resolved: None,
-        }
-    }
-}
-
 /// Set-action config for `set large-community NAME {|additive|delete}`.
 /// `name` references a large-community-set; `resolved` is populated by
 /// `policy_entry_sync` from the large-community-set registry. Reuses
 /// [`SetCommunityMode`] over the LARGE_COMMUNITIES attribute.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SetLargeCommunityConfig {
     pub name: String,
     pub mode: SetCommunityMode,
     pub resolved: Option<LargeCommunitySet>,
-}
-
-impl SetLargeCommunityConfig {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            mode: SetCommunityMode::Replace,
-            resolved: None,
-        }
-    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -1334,17 +1304,18 @@ impl ConfigBuilder {
             // `set community NAME {|additive|delete}` — presence
             // container with a mandatory `name` and a `choice mode`
             // whose three cases are bare keywords (or empty for
-            // replace). YANG fires per-leaf callbacks; we maintain a
-            // single `SetCommunityConfig` and patch in/out the mode.
+            // replace). YANG fires per-leaf callbacks in tree order, so
+            // `additive` and `delete` come before `name`: whichever leaf
+            // comes first creates the single `SetCommunityConfig`.
             .path("/entry/set/community/name")
             .set(|policy, cache, name, seq, args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
                 let community_name = args.string().context(ARG_ERR)?;
-                match entry.set_community.as_mut() {
-                    Some(cfg) => cfg.name = community_name,
-                    None => entry.set_community = Some(SetCommunityConfig::new(community_name)),
-                }
+                entry
+                    .set_community
+                    .get_or_insert_with(Default::default)
+                    .name = community_name;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1359,12 +1330,12 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Additive;
-                }
-                // No-op if name not yet set; the YANG choice ensures
-                // additive and delete are mutually exclusive at the
-                // schema level.
+                entry
+                    .set_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Additive;
+                // The YANG choice ensures additive and delete are
+                // mutually exclusive at the schema level.
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1381,9 +1352,10 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Delete;
-                }
+                entry
+                    .set_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Delete;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1412,10 +1384,10 @@ impl ConfigBuilder {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
                 let ext_name = args.string().context(ARG_ERR)?;
-                match entry.set_ext_community.as_mut() {
-                    Some(cfg) => cfg.name = ext_name,
-                    None => entry.set_ext_community = Some(SetExtCommunityConfig::new(ext_name)),
-                }
+                entry
+                    .set_ext_community
+                    .get_or_insert_with(Default::default)
+                    .name = ext_name;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1428,9 +1400,10 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_ext_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Additive;
-                }
+                entry
+                    .set_ext_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Additive;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1447,9 +1420,10 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_ext_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Delete;
-                }
+                entry
+                    .set_ext_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Delete;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1476,10 +1450,10 @@ impl ConfigBuilder {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
                 let lc_name = args.string().context(ARG_ERR)?;
-                match entry.set_large_community.as_mut() {
-                    Some(cfg) => cfg.name = lc_name,
-                    None => entry.set_large_community = Some(SetLargeCommunityConfig::new(lc_name)),
-                }
+                entry
+                    .set_large_community
+                    .get_or_insert_with(Default::default)
+                    .name = lc_name;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1492,9 +1466,10 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_large_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Additive;
-                }
+                entry
+                    .set_large_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Additive;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -1511,9 +1486,10 @@ impl ConfigBuilder {
             .set(|policy, cache, name, seq, _args| {
                 let list = cache_get(policy, cache, &name).context(ARG_ERR)?;
                 let entry = list.entry(seq);
-                if let Some(cfg) = entry.set_large_community.as_mut() {
-                    cfg.mode = SetCommunityMode::Delete;
-                }
+                entry
+                    .set_large_community
+                    .get_or_insert_with(Default::default)
+                    .mode = SetCommunityMode::Delete;
                 Ok(())
             })
             .del(|policy, cache, name, seq, _args| {
@@ -2105,6 +2081,58 @@ mod tests {
     fn parse_evpn_route_type_rejects_unknown() {
         assert!(parse_evpn_route_type("type1").is_err());
         assert!(parse_evpn_route_type("").is_err());
+    }
+
+    fn set(cfg: &mut PolicyConfig, path: &str, args: &[&str]) {
+        let args = Args(args.iter().map(|a| a.to_string()).collect());
+        cfg.exec(format!("/policy{path}"), args, ConfigOp::Set)
+            .unwrap();
+    }
+
+    /// A commit runs the leaf callbacks of `set community` in tree order,
+    /// so `additive` and `delete` come before `name`.
+    #[test]
+    fn a_set_community_mode_is_kept_when_it_comes_before_the_name() {
+        let mut cfg = PolicyConfig::new();
+        set(&mut cfg, "/entry/set/community/delete", &["P", "10"]);
+        set(&mut cfg, "/entry/set/community/name", &["P", "10", "C"]);
+        set(&mut cfg, "/entry/set/ext-community/additive", &["P", "10"]);
+        set(&mut cfg, "/entry/set/ext-community/name", &["P", "10", "E"]);
+        set(&mut cfg, "/entry/set/large-community/delete", &["P", "10"]);
+        set(
+            &mut cfg,
+            "/entry/set/large-community/name",
+            &["P", "10", "L"],
+        );
+
+        let entry = &cfg.cache["P"].entry[&10];
+        let community = entry.set_community.as_ref().unwrap();
+        assert_eq!(
+            (community.name.as_str(), community.mode),
+            ("C", SetCommunityMode::Delete)
+        );
+        let ext = entry.set_ext_community.as_ref().unwrap();
+        assert_eq!(
+            (ext.name.as_str(), ext.mode),
+            ("E", SetCommunityMode::Additive)
+        );
+        let large = entry.set_large_community.as_ref().unwrap();
+        assert_eq!(
+            (large.name.as_str(), large.mode),
+            ("L", SetCommunityMode::Delete)
+        );
+    }
+
+    #[test]
+    fn a_set_community_mode_is_kept_when_it_comes_after_the_name() {
+        let mut cfg = PolicyConfig::new();
+        set(&mut cfg, "/entry/set/community/name", &["P", "10", "C"]);
+        set(&mut cfg, "/entry/set/community/additive", &["P", "10"]);
+        let community = cfg.cache["P"].entry[&10].set_community.clone().unwrap();
+        assert_eq!(
+            (community.name.as_str(), community.mode),
+            ("C", SetCommunityMode::Additive)
+        );
     }
 }
 

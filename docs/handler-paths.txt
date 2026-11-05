@@ -80,6 +80,7 @@
 /router/bgp/dynamic-neighbors/listen-limit
 /router/bgp/dynamic-neighbors/listen-range
 /router/bgp/dynamic-neighbors/listen-range/neighbor-group
+/router/bgp/ebgp-requires-policy
 /router/bgp/fast-external-failover
 /router/bgp/global/as
 /router/bgp/global/router-id
@@ -160,6 +161,11 @@
 /router/bgp/neighbor/afi-safi/policy/out
 /router/bgp/neighbor/afi-safi/prefix-set/in
 /router/bgp/neighbor/afi-safi/prefix-set/out
+/router/bgp/neighbor/afi-safi/prefix-sid/accept
+/router/bgp/neighbor/afi-safi/prefix-sid/send
+/router/bgp/neighbor/afi-safi/send-community/extended
+/router/bgp/neighbor/afi-safi/send-community/large
+/router/bgp/neighbor/afi-safi/send-community/standard
 /router/bgp/neighbor/allowas-in
 /router/bgp/neighbor/allowas-in/count
 /router/bgp/neighbor/allowas-in/origin
@@ -255,6 +261,7 @@
 /router/bgp/vrf/afi-safi/mup/segment/lookup-network-instance
 /router/bgp/vrf/afi-safi/mup/segment/mup-ext-comm
 /router/bgp/vrf/afi-safi/mup/segment/prefix
+/router/bgp/vrf/ebgp-requires-policy
 /router/bgp/vrf/encapsulation
 /router/bgp/vrf/evpn/advertise-ipv4
 /router/bgp/vrf/evpn/advertise-ipv6
@@ -275,6 +282,11 @@
 /router/bgp/vrf/neighbor/afi-safi/policy/out
 /router/bgp/vrf/neighbor/afi-safi/prefix-set/in
 /router/bgp/vrf/neighbor/afi-safi/prefix-set/out
+/router/bgp/vrf/neighbor/afi-safi/prefix-sid/accept
+/router/bgp/vrf/neighbor/afi-safi/prefix-sid/send
+/router/bgp/vrf/neighbor/afi-safi/send-community/extended
+/router/bgp/vrf/neighbor/afi-safi/send-community/large
+/router/bgp/vrf/neighbor/afi-safi/send-community/standard
 /router/bgp/vrf/neighbor/allowas-in
 /router/bgp/vrf/neighbor/allowas-in/count
 /router/bgp/vrf/neighbor/allowas-in/origin

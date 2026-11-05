@@ -93,7 +93,11 @@ impl BgpShard {
                 vec![self.best_path_delta_lu(ident, nlri, Vec::new())]
             }
             ShardMsg::PeerDown { ident } => self.handle_peer_down(ident),
-            ShardMsg::SoftInV4 { ident, from_client } => self.handle_soft_in_v4(ident, from_client),
+            ShardMsg::SoftInV4 {
+                ident,
+                from_client,
+                unbound_policy,
+            } => self.handle_soft_in_v4(ident, from_client, unbound_policy),
             ShardMsg::PolicyReplace { ident, policy } => {
                 self.set_in_policy(ident, policy);
                 Vec::new()
@@ -337,6 +341,7 @@ impl BgpShard {
                 vrf_transit_only: false,
                 decision: None,
                 compute_policy: b.compute_policy,
+                unbound_policy: b.unbound_policy,
                 // The batch path is v4-unicast only (`rd: None`), so it
                 // never mints a VPNv4 transit label.
             }));
@@ -367,6 +372,7 @@ impl BgpShard {
             vrf_transit_only,
             decision,
             compute_policy,
+            unbound_policy,
         } = u;
 
         let mut rib = BgpRib::new_arc(
@@ -395,6 +401,7 @@ impl BgpShard {
                 Some(p) => crate::bgp::route::apply_policy_net(
                     &p.prefix_set,
                     &p.policy_list,
+                    unbound_policy,
                     peer_router_id,
                     ipnet::IpNet::V4(nlri.prefix),
                     (*rib.attr).clone(),
@@ -404,6 +411,7 @@ impl BgpShard {
                 None => crate::bgp::route::apply_policy_net(
                     &Default::default(),
                     &Default::default(),
+                    unbound_policy,
                     peer_router_id,
                     ipnet::IpNet::V4(nlri.prefix),
                     (*rib.attr).clone(),
@@ -985,7 +993,12 @@ impl BgpShard {
     /// next replay), a permitted route re-interns + re-runs best-path; the
     /// async reduce drives FIB + advertise (incl. AddPath via `added`).
     /// v4-unicast only — VPNv4 soft-in stays on the synchronous shard.
-    fn handle_soft_in_v4(&mut self, ident: usize, from_client: bool) -> Vec<ShardOut> {
+    fn handle_soft_in_v4(
+        &mut self,
+        ident: usize,
+        from_client: bool,
+        unbound_policy: crate::bgp::policy::UnboundPolicy,
+    ) -> Vec<ShardOut> {
         // Snapshot the stored rows so the per-row Loc-RIB mutation below
         // doesn't alias the Adj-RIB-In iteration.
         let entries: Vec<(Ipv4Net, Vec<BgpRib>)> = match self.adj_in(ident) {
@@ -1007,6 +1020,7 @@ impl BgpShard {
                     Some(p) => crate::bgp::route::apply_policy_net(
                         &p.prefix_set,
                         &p.policy_list,
+                        unbound_policy,
                         stored.router_id,
                         ipnet::IpNet::V4(prefix),
                         pre,
@@ -1016,6 +1030,7 @@ impl BgpShard {
                     None => crate::bgp::route::apply_policy_net(
                         &Default::default(),
                         &Default::default(),
+                        unbound_policy,
                         stored.router_id,
                         ipnet::IpNet::V4(prefix),
                         pre,
@@ -1109,6 +1124,7 @@ mod tests {
                 tag: 0,
             }),
             compute_policy: false,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         })
     }
 
@@ -1134,6 +1150,7 @@ mod tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         })
     }
 
@@ -1214,6 +1231,7 @@ mod tests {
                 tag: 202,
             }),
             compute_policy: false,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
         let [ShardOut::BestPathV4 { selected, .. }] = &out[..] else {
             panic!("expected one BestPathV4");
@@ -1332,6 +1350,7 @@ mod tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
         let row = shard
             .v4vpn
@@ -1371,6 +1390,7 @@ mod tests {
             vrf_transit_only: false,
             decision: None,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
         let row = shard
             .v4vpn
@@ -1664,6 +1684,51 @@ mod tests {
         );
     }
 
+    /// RFC 8212: with no inbound policy bound, the verdict that travels
+    /// with the UPDATE (and with a soft-in replay) decides, and a denied
+    /// route stays in the Adj-RIB-In for the next replay.
+    #[test]
+    fn compute_policy_applies_the_unbound_verdict() {
+        use crate::bgp::policy::UnboundPolicy;
+        let mut shard = BgpShard::default();
+        let prefix: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+
+        let ShardMsg::UpdateV4(mut update) = update_v4_compute(7, "10.0.0.0/24", "192.0.2.1")
+        else {
+            unreachable!()
+        };
+        update.unbound_policy = UnboundPolicy::Deny;
+        let out = shard.handle(ShardMsg::UpdateV4(update));
+        assert!(
+            matches!(&out[..], [ShardOut::BestPathV4 { selected, .. }] if selected.is_empty()),
+            "an external route with no policy stays out of the Loc-RIB"
+        );
+        assert!(
+            shard
+                .adj_in(7)
+                .is_some_and(|a| a.v4.0.contains_key(&prefix)),
+            "but it is kept in the Adj-RIB-In"
+        );
+
+        let replay = |shard: &mut BgpShard, unbound_policy| {
+            shard.handle(ShardMsg::SoftInV4 {
+                ident: 7,
+                from_client: false,
+                unbound_policy,
+            })
+        };
+        let out = replay(&mut shard, UnboundPolicy::Permit);
+        assert!(
+            matches!(&out[..], [ShardOut::BestPathV4 { selected, .. }] if selected.len() == 1),
+            "a permit replay brings it in"
+        );
+        let out = replay(&mut shard, UnboundPolicy::Deny);
+        assert!(
+            matches!(&out[..], [ShardOut::BestPathV4 { selected, .. }] if selected.is_empty()),
+            "a deny replay takes it out again"
+        );
+    }
+
     fn dump_params() -> super::super::msg::DumpParamsV4 {
         super::super::msg::DumpParamsV4 {
             add_path: false,
@@ -1777,6 +1842,7 @@ mod tests {
             stale: false,
             nexthop_reachable: true,
             compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
         }));
         let first = adj_in_v4_attr(&shard, 2, "10.0.0.0/24");
         assert!(Arc::ptr_eq(
@@ -1836,6 +1902,7 @@ mod tests {
                     tag: 0,
                 }),
                 compute_policy: false,
+                unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
             })
         };
         let mut shard = BgpShard::default();

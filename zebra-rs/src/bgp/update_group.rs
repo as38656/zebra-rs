@@ -40,7 +40,7 @@ use crate::context::Timer;
 
 /// Bumped whenever a new field is added to `UpdateGroupSig`. Surfaced
 /// in `show bgp update-group` so a stale view is detectable.
-pub const SIGNATURE_VERSION: u32 = 10;
+pub const SIGNATURE_VERSION: u32 = 11;
 
 /// Address families the grouping logic considers — every family whose
 /// advertise pipeline consults `peer.update_group_id`. IPv6 unicast
@@ -232,6 +232,17 @@ pub struct UpdateGroupSig {
     /// faster one, or vice versa). `Some(0)` disables the MRAI — the
     /// group flushes on the next tick (see `start_adv_timer_ipv4`).
     pub adv_interval_override: Option<u16>,
+    /// What the out-policy does when nothing is bound (RFC 8212). It
+    /// follows the instance `ebgp-requires-policy`, so a change of the
+    /// knob moves the eBGP peers to new groups, which re-syncs them.
+    pub unbound_policy: super::policy::UnboundPolicy,
+    /// This family's attribute rules run after the out-policy
+    /// (`send-community`, the Route Target strip toward a VRF CE).
+    pub post_policy: super::attr_filter::PostPolicyFilter,
+    /// Whether a plain-unicast route keeps its BGP Prefix-SID toward this
+    /// peer (RFC 8669 §5.1). Stamped for eBGP unicast groups only: an iBGP
+    /// peer or another family never runs the rule.
+    pub prefix_sid_send: bool,
     pub signature_version: u32,
 }
 
@@ -543,6 +554,12 @@ pub fn signature_of(peer: &Peer, afi: Afi, safi: Safi) -> Option<UpdateGroupSig>
         // timing knob, not a per-family transform). `None` inherits the
         // instance-level `router bgp timer adv-interval` cadence.
         adv_interval_override: peer.config.timer.min_adv_interval,
+        unbound_policy: peer.unbound_policy(),
+        post_policy: peer.post_policy_filter(afi_safi),
+        prefix_sid_send: safi == Safi::Unicast
+            && matches!(afi, Afi::Ip | Afi::Ip6)
+            && peer.is_ebgp()
+            && peer.prefix_sid_send(afi),
         signature_version: SIGNATURE_VERSION,
     })
 }
@@ -1924,6 +1941,9 @@ mod tests {
             egress_script: None,
             attach_unknown_attr: None,
             adv_interval_override: None,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
+            post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
+            prefix_sid_send: false,
             signature_version: SIGNATURE_VERSION,
         }
     }

@@ -9,7 +9,7 @@ use nom_derive::*;
 use crate::{
     Afi, AttrFlags, AttrType, BGP_EXTENDED_PACKET_LEN, BGP_HEADER_LEN, BGP_PACKET_LEN, BgpAttr,
     BgpHeader, BgpParseError, BgpType, Ipv4Nlri, MpReachAttr, MpUnreachAttr, ParseOption, Safi,
-    nlri_psize, parse_bgp_nlri_ipv4, parse_bgp_update_attribute,
+    UpdateAttributes, nlri_psize, parse_bgp_nlri_ipv4, parse_bgp_update_attribute,
 };
 
 /// IPv6 next-hop that an RFC 8950 IPv4-over-IPv6 advertisement carries
@@ -48,6 +48,11 @@ pub struct UpdatePacket {
     /// rather than installed. Not a wire field.
     #[nom(Ignore)]
     pub treat_as_withdraw: bool,
+    /// RFC 8669 §4: the BGP Prefix-SID attribute came from an external
+    /// peer for a family that does not accept it and was dropped during
+    /// parse. Not a wire field.
+    #[nom(Ignore)]
+    pub prefix_sid_discarded: bool,
     #[nom(Ignore)]
     max_packet_size: usize,
     /// Whether the session this UPDATE is bound for negotiated 4-octet
@@ -82,6 +87,7 @@ impl Default for UpdatePacket {
             mp_update: None,
             mp_withdraw: None,
             treat_as_withdraw: false,
+            prefix_sid_discarded: false,
             max_packet_size: BGP_PACKET_LEN,
             as4: true,
         }
@@ -742,15 +748,6 @@ impl UpdatePacket {
         let (input, mut withdrawal) = parse_bgp_nlri_ipv4(input, withdraw_len, add_path)?;
         packet.ipv4_withdraw.append(&mut withdrawal);
         let (input, attr_len) = be_u16(input)?;
-        let (input, bgp_attr, mp_update, mp_withdraw, treat_as_withdraw) = if attr_len > 0 {
-            parse_bgp_update_attribute(input, attr_len, as4, opt)?
-        } else {
-            (input, None, None, None, false)
-        };
-        packet.bgp_attr = bgp_attr;
-        packet.mp_update = mp_update;
-        packet.mp_withdraw = mp_withdraw;
-        packet.treat_as_withdraw = treat_as_withdraw;
         let nlri_len = packet
             .header
             .length
@@ -759,6 +756,16 @@ impl UpdatePacket {
             .saturating_sub(withdraw_len)
             .saturating_sub(2)
             .saturating_sub(attr_len);
+        let (input, attrs) = if attr_len > 0 {
+            parse_bgp_update_attribute(input, attr_len, as4, opt, nlri_len > 0)?
+        } else {
+            (input, UpdateAttributes::default())
+        };
+        packet.bgp_attr = attrs.bgp_attr;
+        packet.mp_update = attrs.mp_update;
+        packet.mp_withdraw = attrs.mp_withdraw;
+        packet.treat_as_withdraw = attrs.treat_as_withdraw;
+        packet.prefix_sid_discarded = attrs.prefix_sid_discarded;
         let (input, mut updates) = parse_bgp_nlri_ipv4(input, nlri_len, add_path)?;
         packet.ipv4_update.append(&mut updates);
         Ok((input, packet))
@@ -772,7 +779,7 @@ mod tests {
     use ipnet::Ipv4Net;
 
     use super::*;
-    use crate::{BgpPeerType, Direct};
+    use crate::{AfiSafi, BgpPeerType, Direct};
 
     /// An UPDATE too long for the 2-octet header Length must be refused, not
     /// wrapped. Regression: `buf.len() as u16` silently truncated, so a
@@ -1001,6 +1008,177 @@ mod tests {
             .expect("must decode");
         let attr = parsed.bgp_attr.expect("attributes present");
         assert_eq!(attr.local_pref.map(|lp| lp.local_pref), Some(500));
+    }
+
+    /// A BGP Prefix-SID attribute with one Label-Index TLV (label index
+    /// 100), or with a Label-Index TLV one octet short when `malformed`.
+    fn prefix_sid_attr(malformed: bool) -> Vec<u8> {
+        let value: Vec<u8> = if malformed {
+            vec![1, 0x00, 0x06, 0, 0, 0, 0, 0, 100]
+        } else {
+            vec![1, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 100]
+        };
+        let mut attr = vec![0xc0, 40, value.len() as u8]; // optional + transitive
+        attr.extend_from_slice(&value);
+        attr
+    }
+
+    /// MP_REACH for 2001:db8::/64 (IPv6 unicast) via 2001:db8::1.
+    fn mp_reach_ipv6() -> Vec<u8> {
+        let mut value = vec![0x00, 0x02, 0x01, 16];
+        value.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        value.push(0); // SNPA
+        value.extend_from_slice(&[64, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0]);
+        let mut attr = vec![0x80, 14, value.len() as u8];
+        attr.extend_from_slice(&value);
+        attr
+    }
+
+    /// MP_REACH for 10.1.0.0/24 in RD 0:1 (VPNv4), label 16, via 192.0.2.1.
+    fn mp_reach_vpnv4() -> Vec<u8> {
+        let mut value = vec![0x00, 0x01, 128, 12];
+        value.extend_from_slice(&[0; 8]); // next-hop RD
+        value.extend_from_slice(&[192, 0, 2, 1]);
+        value.push(0); // SNPA
+        value.push(24 + 64 + 24);
+        value.extend_from_slice(&[0x00, 0x01, 0x01]); // label 16, bottom of stack
+        value.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // RD 0:1
+        value.extend_from_slice(&[10, 1, 0]);
+        let mut attr = vec![0x80, 14, value.len() as u8];
+        attr.extend_from_slice(&value);
+        attr
+    }
+
+    /// A full UPDATE with ORIGIN / AS_PATH / NEXT_HOP, the `extra`
+    /// attributes and, when `ipv4_nlri`, the traditional NLRI 10.0.0.0/24.
+    fn update_with_attrs(extra: &[u8], ipv4_nlri: bool) -> Vec<u8> {
+        let mut attrs = vec![0x40u8, 0x01, 0x01, 0x00]; // ORIGIN = IGP
+        attrs.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9]);
+        attrs.extend_from_slice(&[0x40, 0x03, 0x04, 192, 0, 2, 1]); // NEXT_HOP
+        attrs.extend_from_slice(extra);
+        let nlri: &[u8] = if ipv4_nlri { &[24, 10, 0, 0] } else { &[] };
+        let mut buf = vec![0xffu8; 16];
+        let total = BGP_HEADER_LEN as usize + 2 + 2 + attrs.len() + nlri.len();
+        buf.extend_from_slice(&(total as u16).to_be_bytes());
+        buf.push(2); // type = UPDATE
+        buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn routes length
+        buf.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&attrs);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    /// The session option with the given Prefix-SID discard families.
+    fn opt_discarding(peer_type: BgpPeerType, families: &[(Afi, Safi)]) -> Option<ParseOption> {
+        let mut opt = opt_for(peer_type).expect("option");
+        opt.prefix_sid_discard = families
+            .iter()
+            .map(|(afi, safi)| AfiSafi::new(*afi, *safi))
+            .collect();
+        Some(opt)
+    }
+
+    const UNICAST: [(Afi, Safi); 2] = [(Afi::Ip, Safi::Unicast), (Afi::Ip6, Safi::Unicast)];
+
+    /// RFC 8669 §4: from an external peer not configured to accept it, the
+    /// Prefix-SID on IPv4 unicast routes is discarded; the route stands.
+    #[test]
+    fn prefix_sid_from_ebgp_on_ipv4_unicast_is_discarded() {
+        let buf = update_with_attrs(&prefix_sid_attr(false), true);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ebgp, &UNICAST))
+                .expect("must decode");
+        assert!(parsed.prefix_sid_discarded);
+        assert!(!parsed.treat_as_withdraw);
+        assert_eq!(parsed.bgp_attr.expect("attributes").prefix_sid, None);
+        assert_eq!(parsed.ipv4_update.len(), 1, "the route is accepted");
+    }
+
+    /// The same for IPv6 unicast carried in MP_REACH.
+    #[test]
+    fn prefix_sid_from_ebgp_on_ipv6_unicast_is_discarded() {
+        let mut extra = prefix_sid_attr(false);
+        extra.extend_from_slice(&mp_reach_ipv6());
+        let buf = update_with_attrs(&extra, false);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ebgp, &UNICAST))
+                .expect("must decode");
+        assert!(parsed.prefix_sid_discarded);
+        assert_eq!(parsed.bgp_attr.expect("attributes").prefix_sid, None);
+        assert!(matches!(parsed.mp_update, Some(MpReachAttr::Ipv6 { .. })));
+    }
+
+    /// Discarded before it is parsed: a malformed Prefix-SID that is going
+    /// to be dropped costs neither the route nor the session.
+    #[test]
+    fn malformed_prefix_sid_from_ebgp_is_discarded_not_withdrawn() {
+        let buf = update_with_attrs(&prefix_sid_attr(true), true);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ebgp, &UNICAST))
+                .expect("must decode");
+        assert!(parsed.prefix_sid_discarded);
+        assert!(!parsed.treat_as_withdraw);
+        assert_eq!(parsed.ipv4_update.len(), 1);
+    }
+
+    /// A family configured to accept the attribute (absent from the
+    /// discard set) keeps it.
+    #[test]
+    fn prefix_sid_from_ebgp_is_kept_when_the_family_accepts_it() {
+        let buf = update_with_attrs(&prefix_sid_attr(false), true);
+        let (_, parsed) = UpdatePacket::parse_packet(
+            &buf,
+            true,
+            opt_discarding(BgpPeerType::Ebgp, &[(Afi::Ip6, Safi::Unicast)]),
+        )
+        .expect("must decode");
+        assert!(!parsed.prefix_sid_discarded);
+        let attr = parsed.bgp_attr.expect("attributes");
+        assert_eq!(attr.prefix_sid_label_index(), Some(100));
+    }
+
+    /// The discard is for external sessions only.
+    #[test]
+    fn prefix_sid_from_ibgp_is_kept() {
+        let buf = update_with_attrs(&prefix_sid_attr(false), true);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ibgp, &UNICAST))
+                .expect("must decode");
+        assert!(!parsed.prefix_sid_discarded);
+        let attr = parsed.bgp_attr.expect("attributes");
+        assert_eq!(attr.prefix_sid_label_index(), Some(100));
+    }
+
+    /// A VPN family is not in the discard set: an eBGP VPNv4 session (an
+    /// Inter-AS option B link) keeps the attribute.
+    #[test]
+    fn prefix_sid_from_ebgp_on_vpnv4_is_kept() {
+        let mut extra = prefix_sid_attr(false);
+        extra.extend_from_slice(&mp_reach_vpnv4());
+        let buf = update_with_attrs(&extra, false);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ebgp, &UNICAST))
+                .expect("must decode");
+        assert!(!parsed.prefix_sid_discarded);
+        assert!(matches!(parsed.mp_update, Some(MpReachAttr::Vpnv4(_))));
+        let attr = parsed.bgp_attr.expect("attributes");
+        assert_eq!(attr.prefix_sid_label_index(), Some(100));
+    }
+
+    /// One attribute serves every NLRI of the UPDATE. When IPv4 unicast
+    /// NLRI ride beside an accepted VPN family, the attribute must still
+    /// not reach the unicast routes.
+    #[test]
+    fn prefix_sid_is_discarded_when_ipv4_nlri_ride_beside_a_vpn_family() {
+        let mut extra = prefix_sid_attr(false);
+        extra.extend_from_slice(&mp_reach_vpnv4());
+        let buf = update_with_attrs(&extra, true);
+        let (_, parsed) =
+            UpdatePacket::parse_packet(&buf, true, opt_discarding(BgpPeerType::Ebgp, &UNICAST))
+                .expect("must decode");
+        assert!(parsed.prefix_sid_discarded);
+        assert_eq!(parsed.bgp_attr.expect("attributes").prefix_sid, None);
+        assert_eq!(parsed.ipv4_update.len(), 1);
     }
 
     /// With no `ParseOption` at all nothing says the session is external,

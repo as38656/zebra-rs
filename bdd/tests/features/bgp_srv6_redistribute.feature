@@ -23,7 +23,9 @@ Feature: BGP IPv6 redistribute connected with SRv6 End.DT6 origination
     unicast routes carry an End.DT6 SID carved from the locator.
   - z1 redistributes connected; the dummy `cust0` prefix
     `2001:db8:cafe::/64` is originated into BGP with the SID stamped at
-    origination (visible as a "Local SID" in `show bgp ipv6`).
+    origination (visible as a "Local SID" in `show bgp ipv6`). z2 is an
+    external peer, so z1 sets `afi-safi ipv6 prefix-sid send` toward it:
+    without it the SID does not cross the AS boundary.
   - z2 peers eBGP over IPv6 and sets `encapsulation-type srv6` on the
     session, so it only accepts SID-bearing routes; the redistributed
     prefix arrives carrying the SID (shown as a "Remote SID").
