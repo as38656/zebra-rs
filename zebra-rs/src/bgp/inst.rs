@@ -4619,6 +4619,10 @@ impl Bgp {
         } else {
             super::update_group::resend_ipv4_enhe(peer, self.router_id, self.as_sets_withdraw);
         }
+        let (mut top, peers) = super::peer::advertise_top(self);
+        if let Some(peer) = peers.get_mut_by_idx(ident) {
+            super::default_originate::sync(peer, bgp_packet::Afi::Ip, &mut top);
+        }
     }
 
     /// Our RTC membership (RFC 4684), IPv4 and IPv6: the union of the local
@@ -9707,3 +9711,7 @@ mod attr_intern_tests;
 #[cfg(test)]
 #[path = "prefix_limit_tests.rs"]
 mod prefix_limit_tests;
+
+#[cfg(test)]
+#[path = "default_originate_tests.rs"]
+mod default_originate_tests;

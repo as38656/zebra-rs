@@ -40,7 +40,7 @@ use crate::context::Timer;
 
 /// Bumped whenever a new field is added to `UpdateGroupSig`. Surfaced
 /// in `show bgp update-group` so a stale view is detectable.
-pub const SIGNATURE_VERSION: u32 = 11;
+pub const SIGNATURE_VERSION: u32 = 12;
 
 /// Address families the grouping logic considers — every family whose
 /// advertise pipeline consults `peer.update_group_id`. IPv6 unicast
@@ -243,6 +243,10 @@ pub struct UpdateGroupSig {
     /// peer (RFC 8669 §5.1). Stamped for eBGP unicast groups only: an iBGP
     /// peer or another family never runs the rule.
     pub prefix_sid_send: bool,
+    /// The family's `default-originate`, stamped for the IPv4 and IPv6
+    /// unicast groups only. A member with it is sent its own default and
+    /// never the Loc-RIB one, so it cannot share UPDATEs with one without.
+    pub default_originate: Option<super::default_originate::DefaultOriginateConfig>,
     pub signature_version: u32,
 }
 
@@ -560,6 +564,11 @@ pub fn signature_of(peer: &Peer, afi: Afi, safi: Safi) -> Option<UpdateGroupSig>
             && matches!(afi, Afi::Ip | Afi::Ip6)
             && peer.is_ebgp()
             && peer.prefix_sid_send(afi),
+        default_originate: if safi == Safi::Unicast {
+            peer.default_originate_config(afi).cloned()
+        } else {
+            None
+        },
         signature_version: SIGNATURE_VERSION,
     })
 }
@@ -1818,7 +1827,7 @@ pub fn flush_done_ipv6(
 /// (`BgpNexthop::Ipv6`); a non-v6 next-hop degrades to the
 /// unspecified address, which the receiver drops. NLRIs are chunked
 /// so each PDU stays within `max_packet_size`.
-fn encode_ipv6_update(
+pub(super) fn encode_ipv6_update(
     attr: &Arc<BgpAttr>,
     nlris: &[Ipv6Nlri],
     max_packet_size: usize,
@@ -1944,6 +1953,7 @@ mod tests {
             unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
             post_policy: crate::bgp::attr_filter::PostPolicyFilter::default(),
             prefix_sid_send: false,
+            default_originate: None,
             signature_version: SIGNATURE_VERSION,
         }
     }

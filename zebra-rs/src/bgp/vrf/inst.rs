@@ -3786,6 +3786,7 @@ impl BgpVrf {
         let before_mp: std::collections::BTreeSet<bgp_packet::AfiSafi> =
             peer.config.mp.0.keys().copied().collect();
         let before_filters = peer.attr_filter_config();
+        let before_defaults = peer.default_originate_configs();
         let before_limits = peer.prefix_limits();
         peer.remote_as = remote_as;
         peer.peer_type = if remote_as == self.asn {
@@ -3804,7 +3805,9 @@ impl BgpVrf {
         bounce |= before_mp != after_mp && peer.state.is_established();
         // Unlike next-hop-self, these knobs change what was already sent,
         // so the peer is re-synced instead of waiting for the next route.
-        let resync_out = !bounce && peer.attr_filter_config() != before_filters;
+        let resync_out = !bounce
+            && (peer.attr_filter_config() != before_filters
+                || peer.default_originate_configs() != before_defaults);
         let after_limits = peer.prefix_limits();
         let mut changed_limits: Vec<bgp_packet::AfiSafi> = before_limits
             .keys()
@@ -7135,3 +7138,7 @@ mod tests {
 #[cfg(test)]
 #[path = "prefix_limit_tests.rs"]
 mod prefix_limit_tests;
+
+#[cfg(test)]
+#[path = "default_originate_tests.rs"]
+mod default_originate_tests;

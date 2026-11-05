@@ -967,6 +967,9 @@ pub struct PeerSubConfig {
     /// `afi-safi <name> maximum-prefix`. Read through
     /// [`Peer::prefix_limit_of`].
     pub prefix_limit: PrefixLimitConfig,
+    /// `afi-safi <name> default-originate`. Read through
+    /// [`Peer::default_originate_config`].
+    pub default_originate: Option<super::default_originate::DefaultOriginateConfig>,
 }
 
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -1197,6 +1200,8 @@ pub struct Peer {
     pub prefix_limit: BTreeMap<AfiSafi, PrefixLimitState>,
     /// Set while the peer is kept down for going over a limit.
     pub prefix_overflow: Option<PrefixOverflow>,
+    /// The families of this session that hold the originated default.
+    pub default_originate: super::default_originate::DefaultOriginateState,
     /// This session's IPv4 unicast counts while the pool workers hold
     /// the routes (N>1). `None` at N=1 and between sessions.
     pub prefix_gauge: Option<Arc<PoolPrefixGauge>>,
@@ -1486,6 +1491,7 @@ impl Peer {
             prefix_sid_discarded: 0,
             prefix_limit: BTreeMap::new(),
             prefix_overflow: None,
+            default_originate: Default::default(),
             prefix_gauge: None,
             peer_type: PeerType::IBGP,
             instance: PeerInstance::Global,
@@ -1676,6 +1682,30 @@ impl Peer {
             .sub
             .iter()
             .filter_map(|(afi_safi, sub)| Some((*afi_safi, sub.prefix_limit.limit()?)))
+            .collect()
+    }
+
+    /// `afi-safi <afi> default-originate` of the unicast family of `afi`.
+    pub fn default_originate_config(
+        &self,
+        afi: Afi,
+    ) -> Option<&super::default_originate::DefaultOriginateConfig> {
+        self.config
+            .sub
+            .get(&AfiSafi::new(afi, Safi::Unicast))?
+            .default_originate
+            .as_ref()
+    }
+
+    /// Every `default-originate` statement, by family, to tell whether a
+    /// config swap changed one.
+    pub fn default_originate_configs(
+        &self,
+    ) -> BTreeMap<AfiSafi, super::default_originate::DefaultOriginateConfig> {
+        self.config
+            .sub
+            .iter()
+            .filter_map(|(afi_safi, sub)| Some((*afi_safi, sub.default_originate.clone()?)))
             .collect()
     }
 
@@ -2055,6 +2085,7 @@ impl Peer {
             attach_unknown_attr: self.config.attach_unknown_attr.clone(),
             as_sets_withdraw,
             enhe: self.enhe_next_hop,
+            default_originate: self.default_originate_config(Afi::Ip).is_some(),
         }
     }
 

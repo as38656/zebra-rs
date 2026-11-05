@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use bgp_packet::{Ipv4Nlri, UpdatePacket};
+use bytes::BytesMut;
 use ipnet::Ipv4Net;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -133,6 +134,16 @@ pub enum EgressDeltaV4 {
     CountAdjOut {
         reply: tokio::sync::oneshot::Sender<usize>,
     },
+    /// UPDATEs main built for `prefix` under path id `id` from no Loc-RIB
+    /// row: the default-originate announce or withdraw. They replace what
+    /// `adj_out` holds for `prefix`, so a later re-fan cannot withdraw the
+    /// route the peer now has: a row under `id` is dropped without a
+    /// withdraw, a row under another id is withdrawn first.
+    SendOwn {
+        prefix: Ipv4Net,
+        id: u32,
+        packets: Vec<BytesMut>,
+    },
 }
 
 /// Handle main keeps for a peer's egress task: the delta channel plus the
@@ -211,6 +222,25 @@ impl Engine {
                 // prefix, so `len` matches `peer.adj_out.count` semantics.
                 let _ = reply.send(self.adj_out.0.len());
             }
+            EgressDeltaV4::SendOwn {
+                prefix,
+                id,
+                packets,
+            } => self.send_own(prefix, id, packets),
+        }
+    }
+
+    fn send_own(&mut self, prefix: Ipv4Net, id: u32, packets: Vec<BytesMut>) {
+        for row in self.adj_out.0.remove(&prefix).unwrap_or_default() {
+            let held = if self.add_path { row.local_id } else { 0 };
+            if held != id {
+                let mut update = UpdatePacket::with_max_packet_size(self.ctx.max_packet_size());
+                update.ipv4_withdraw.push(Ipv4Nlri { id: held, prefix });
+                self.ctx.send_update(update);
+            }
+        }
+        for bytes in packets {
+            self.ctx.send_packet(bytes);
         }
     }
 
@@ -509,6 +539,95 @@ mod tests {
         let entries = reply_rx.try_recv().expect("DumpAdjOut replied");
         assert_eq!(entries.len(), 1, "the advertised prefix is in the dump");
         assert_eq!(entries[0].0, prefix);
+    }
+
+    /// The originated default replaces the Loc-RIB default the PET sent: no
+    /// withdraw goes out, and the re-fan after the statement holds the
+    /// Loc-RIB row back without withdrawing the replacement.
+    #[test]
+    fn send_own_replaces_the_held_row_without_a_withdraw() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.packet_tx = Some(tx);
+        let mut engine = Engine {
+            ctx: ctx.clone(),
+            add_path: false,
+            adj_out: AdjRibTable::new(),
+            attr_store: BgpAttrStore::new(),
+        };
+        let default = Ipv4Net::default();
+        engine.advertise(default, rib(5, "192.0.2.1"));
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), 1);
+
+        let own = BytesMut::from(&b"own"[..]);
+        engine.handle(EgressDeltaV4::SendOwn {
+            prefix: default,
+            id: 0,
+            packets: vec![own.clone()],
+        });
+        let sent: Vec<BytesMut> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(sent, vec![own]);
+        assert!(engine.adj_out.0.is_empty());
+
+        ctx.default_originate = true;
+        engine.handle(EgressDeltaV4::Refresh {
+            ctx: Box::new(ctx),
+            add_path: false,
+        });
+        engine.advertise(default, rib(5, "192.0.2.1"));
+        assert!(rx.try_recv().is_err(), "held back, and nothing to withdraw");
+    }
+
+    /// Toward an AddPath peer only the row under the originated path id is
+    /// replaced; a Loc-RIB path under another id is withdrawn first.
+    #[test]
+    fn send_own_withdraws_the_other_paths_first() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = SyncCtx::for_test();
+        ctx.packet_tx = Some(tx);
+        let mut engine = Engine {
+            ctx,
+            add_path: true,
+            adj_out: AdjRibTable::new(),
+            attr_store: BgpAttrStore::new(),
+        };
+        let default = Ipv4Net::default();
+        for (ident, local_id) in [(5, 1), (6, 2)] {
+            let mut row = rib(ident, "192.0.2.1");
+            row.local_id = local_id;
+            engine.record_adj_out(default, row);
+        }
+
+        let own = BytesMut::from(&b"own"[..]);
+        engine.handle(EgressDeltaV4::SendOwn {
+            prefix: default,
+            id: 1,
+            packets: vec![own.clone()],
+        });
+        let sent: Vec<BytesMut> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let mut opt = bgp_packet::ParseOption::default();
+        opt.add_path.insert(
+            bgp_packet::AfiSafi::new(bgp_packet::Afi::Ip, bgp_packet::Safi::Unicast),
+            bgp_packet::Direct {
+                send: false,
+                recv: true,
+            },
+        );
+        let (_, bgp_packet::BgpPacket::Update(withdraw)) =
+            bgp_packet::BgpPacket::parse_packet(&sent[0], true, Some(opt)).unwrap()
+        else {
+            panic!("an UPDATE");
+        };
+        assert_eq!(
+            withdraw.ipv4_withdraw,
+            vec![Ipv4Nlri {
+                id: 2,
+                prefix: default
+            }]
+        );
+        assert_eq!(sent[1], own);
+        assert!(engine.adj_out.0.is_empty());
     }
 
     #[tokio::test]

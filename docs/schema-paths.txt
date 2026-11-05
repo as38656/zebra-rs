@@ -164,6 +164,7 @@
 /router/bgp/neighbor-group/update-source	leaf
 /router/bgp/neighbor/afi-safi	list keys=name
 /router/bgp/neighbor/afi-safi/add-path	leaf
+/router/bgp/neighbor/afi-safi/default-originate	p-container
 /router/bgp/neighbor/afi-safi/enabled	leaf
 /router/bgp/neighbor/afi-safi/encapsulation-type	leaf
 /router/bgp/neighbor/afi-safi/graceful-restart	container
@@ -376,6 +377,7 @@
 /router/bgp/vrf/neighbor	list keys=remote-address
 /router/bgp/vrf/neighbor/afi-safi	list keys=name
 /router/bgp/vrf/neighbor/afi-safi/add-path	leaf
+/router/bgp/vrf/neighbor/afi-safi/default-originate	p-container
 /router/bgp/vrf/neighbor/afi-safi/enabled	leaf
 /router/bgp/vrf/neighbor/afi-safi/encapsulation-type	leaf
 /router/bgp/vrf/neighbor/afi-safi/graceful-restart	container

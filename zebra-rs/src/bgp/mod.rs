@@ -9,6 +9,7 @@ pub mod attr_filter;
 pub mod auth;
 pub mod config;
 pub mod connected;
+pub mod default_originate;
 pub mod dynamic_neighbors;
 pub mod ethernet_segment;
 pub mod evpn_dad;

@@ -150,6 +150,7 @@
 /router/bgp/neighbor-group/ttl-security
 /router/bgp/neighbor-group/update-source
 /router/bgp/neighbor/afi-safi/add-path
+/router/bgp/neighbor/afi-safi/default-originate
 /router/bgp/neighbor/afi-safi/enabled
 /router/bgp/neighbor/afi-safi/encapsulation-type
 /router/bgp/neighbor/afi-safi/graceful-restart/enabled
@@ -276,6 +277,7 @@
 /router/bgp/vrf/label-mode
 /router/bgp/vrf/neighbor
 /router/bgp/vrf/neighbor/afi-safi/add-path
+/router/bgp/vrf/neighbor/afi-safi/default-originate
 /router/bgp/vrf/neighbor/afi-safi/enabled
 /router/bgp/vrf/neighbor/afi-safi/encapsulation-type
 /router/bgp/vrf/neighbor/afi-safi/graceful-restart/enabled

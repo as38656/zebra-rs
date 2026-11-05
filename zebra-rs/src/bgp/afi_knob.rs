@@ -279,6 +279,22 @@ pub(super) fn set_maximum_prefix_force(
     Some(())
 }
 
+/// `afi-safi <name> default-originate` (presence). A set keeps what the
+/// container already holds, so a later leaf of it is not reset.
+pub(super) fn set_default_originate(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+) -> Option<()> {
+    let slot = &mut cfg.sub.entry(afi_safi).or_default().default_originate;
+    if op.is_set() {
+        slot.get_or_insert_with(Default::default);
+    } else {
+        *slot = None;
+    }
+    Some(())
+}
+
 /// `afi-safi <name> next-hop-self <bool>` — records the verbatim
 /// statement only.
 ///

@@ -4024,6 +4024,9 @@ struct Neighbor<'a> {
     /// The `maximum-prefix` of each family that has one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prefix_limits: Vec<PrefixLimitView>,
+    /// The `default-originate` of each family that has one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    default_originate: Vec<DefaultOriginateView>,
     /// Set while the peer is kept down for going over a limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     prefix_overflow: Option<PrefixOverflowView>,
@@ -4071,6 +4074,17 @@ impl PrefixLimitView {
             accepted: counts.accepted,
         }
     }
+}
+
+/// `show bgp neighbor` view of one family's `default-originate`.
+#[derive(Debug, Serialize)]
+struct DefaultOriginateView {
+    #[serde(skip)]
+    afi_safi: AfiSafi,
+    /// The family as the config names it.
+    family: &'static str,
+    /// Whether the neighbor holds the route now.
+    sent: bool,
 }
 
 /// `show bgp neighbor` view of [`Peer::prefix_overflow`].
@@ -4422,6 +4436,15 @@ fn fetch<'a>(peer: &'a Peer, shard: &super::shard::BgpShard) -> Neighbor<'a> {
             .into_iter()
             .map(|(afi_safi, limit)| PrefixLimitView::of(peer, shard, afi_safi, limit))
             .collect(),
+        default_originate: peer
+            .default_originate_configs()
+            .into_keys()
+            .map(|afi_safi| DefaultOriginateView {
+                afi_safi,
+                family: afi_safi_config_name(&afi_safi),
+                sent: peer.default_originate.is_sent(afi_safi.afi),
+            })
+            .collect(),
         prefix_overflow: peer
             .prefix_overflow
             .as_ref()
@@ -4473,38 +4496,69 @@ fn format_nd_elapsed(secs: u64) -> String {
     }
 }
 
-/// The `maximum-prefix` lines of `show bgp neighbor`, worded as FRR's.
-fn render_prefix_limits(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
-    for limit in &neighbor.prefix_limits {
+/// The per-family lines of `show bgp neighbor`, worded and ordered as
+/// FRR's: one header for each family with a `default-originate` or a
+/// `maximum-prefix`, then the overflow note.
+fn render_families(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
+    let families: std::collections::BTreeSet<AfiSafi> = neighbor
+        .default_originate
+        .iter()
+        .map(|default| default.afi_safi)
+        .chain(neighbor.prefix_limits.iter().map(|limit| limit.afi_safi))
+        .collect();
+    for afi_safi in families {
         writeln!(
             out,
             "  For address family: {} {}",
-            limit.afi_safi.afi, limit.afi_safi.safi
+            afi_safi.afi, afi_safi.safi
         )?;
-        writeln!(
-            out,
-            "    {} accepted prefixes, {} received",
-            limit.accepted, limit.received
-        )?;
-        let modes: Vec<&str> = [(limit.force, "force"), (limit.warning_only, "warning-only")]
-            .into_iter()
-            .filter_map(|(on, mode)| on.then_some(mode))
-            .collect();
-        write!(out, "    Maximum prefixes allowed {}", limit.max)?;
-        if !modes.is_empty() {
-            write!(out, " ({})", modes.join(", "))?;
+        if let Some(default) = neighbor
+            .default_originate
+            .iter()
+            .find(|default| default.afi_safi == afi_safi)
+        {
+            let sent = if default.sent { "sent" } else { "not sent" };
+            writeln!(out, "    Default information originate, default {sent}")?;
         }
-        writeln!(out)?;
-        write!(
-            out,
-            "    Threshold for warning message {}%",
-            limit.threshold
-        )?;
-        if let Some(minutes) = limit.restart_minutes {
-            write!(out, ", restart interval {minutes} min")?;
+        if let Some(limit) = neighbor
+            .prefix_limits
+            .iter()
+            .find(|limit| limit.afi_safi == afi_safi)
+        {
+            render_prefix_limit(out, limit)?;
         }
-        writeln!(out)?;
     }
+    render_prefix_overflow(out, neighbor)
+}
+
+/// The `maximum-prefix` lines of one family.
+fn render_prefix_limit(out: &mut String, limit: &PrefixLimitView) -> std::fmt::Result {
+    writeln!(
+        out,
+        "    {} accepted prefixes, {} received",
+        limit.accepted, limit.received
+    )?;
+    let modes: Vec<&str> = [(limit.force, "force"), (limit.warning_only, "warning-only")]
+        .into_iter()
+        .filter_map(|(on, mode)| on.then_some(mode))
+        .collect();
+    write!(out, "    Maximum prefixes allowed {}", limit.max)?;
+    if !modes.is_empty() {
+        write!(out, " ({})", modes.join(", "))?;
+    }
+    writeln!(out)?;
+    write!(
+        out,
+        "    Threshold for warning message {}%",
+        limit.threshold
+    )?;
+    if let Some(minutes) = limit.restart_minutes {
+        write!(out, ", restart interval {minutes} min")?;
+    }
+    writeln!(out)
+}
+
+fn render_prefix_overflow(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
     if let Some(overflow) = &neighbor.prefix_overflow {
         writeln!(
             out,
@@ -4844,7 +4898,7 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
             neighbor.prefix_sid_discarded
         )?;
     }
-    render_prefix_limits(out, neighbor)?;
+    render_families(out, neighbor)?;
 
     writeln!(out)?;
 
@@ -7418,6 +7472,104 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         assert_eq!(json["prefix_limits"][1]["warning_only"], true);
     }
 
+    /// `default-originate` in `show bgp neighbor`: FRR's line under the
+    /// family, whose header is not repeated for a family that also has a
+    /// `maximum-prefix`. Text and JSON.
+    #[test]
+    fn default_originate_is_shown() {
+        use super::super::default_originate::DefaultOriginateConfig;
+        use super::super::prefix_limit::PrefixLimitConfig;
+
+        let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let v6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let addr: IpAddr = Ipv4Addr::new(10, 0, 0, 9).into();
+        let mut peer = make_peer(addr);
+        for afi_safi in [v4, v6] {
+            peer.config
+                .sub
+                .entry(afi_safi)
+                .or_default()
+                .default_originate = Some(DefaultOriginateConfig::default());
+        }
+        peer.config.sub.entry(v4).or_default().prefix_limit = PrefixLimitConfig {
+            max: Some(10),
+            ..Default::default()
+        };
+        peer.default_originate.set_sent(Afi::Ip, true);
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let view = TestView {
+            rib: LocalRib::default(),
+            shard: super::super::shard::BgpShard::default(),
+            peers,
+        };
+        let show = |json: bool| {
+            let args = Args(VecDeque::from(["10.0.0.9".to_string()]));
+            show_bgp_neighbor(&view, args, json).unwrap()
+        };
+
+        let out = show(false);
+        let lines: Vec<&str> = out.lines().collect();
+        let header = |family: &str| {
+            let header = format!("  For address family: {family}");
+            assert_eq!(
+                lines.iter().filter(|l| **l == header).count(),
+                1,
+                "one `{header}`:\n{out}"
+            );
+            lines.iter().position(|l| *l == header).unwrap()
+        };
+        let v4_at = header("IPv4 Unicast");
+        let v6_at = header("IPv6 Unicast");
+        assert!(v4_at < v6_at, "{out}");
+        assert_eq!(
+            &lines[v4_at + 1..v6_at],
+            &[
+                "    Default information originate, default sent",
+                "    0 accepted prefixes, 0 received",
+                "    Maximum prefixes allowed 10",
+                "    Threshold for warning message 75%",
+            ],
+            "{out}"
+        );
+        assert_eq!(
+            lines[v6_at + 1],
+            "    Default information originate, default not sent",
+            "{out}"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&show(true)).unwrap();
+        assert_eq!(
+            json["default_originate"],
+            serde_json::json!([
+                { "family": "ipv4", "sent": true },
+                { "family": "ipv6", "sent": false },
+            ])
+        );
+        assert_eq!(json["prefix_limits"][0]["family"], "ipv4");
+    }
+
+    /// A neighbor without `default-originate` shows neither the line nor
+    /// the JSON field.
+    #[test]
+    fn no_default_originate_is_not_shown() {
+        let addr: IpAddr = Ipv4Addr::new(10, 0, 0, 9).into();
+        let mut peers = PeerMap::new();
+        peers.insert(addr, make_peer(addr));
+        let view = TestView {
+            rib: LocalRib::default(),
+            shard: super::super::shard::BgpShard::default(),
+            peers,
+        };
+        let show = |json: bool| {
+            let args = Args(VecDeque::from(["10.0.0.9".to_string()]));
+            show_bgp_neighbor(&view, args, json).unwrap()
+        };
+        assert!(!show(false).contains("Default information originate"));
+        let json: serde_json::Value = serde_json::from_str(&show(true)).unwrap();
+        assert!(json.get("default_originate").is_none(), "{json}");
+    }
+
     /// Interface-keyed (IPv6 unnumbered) peers were invisible to every
     /// summary: the renderers iterated the address-keyed `iter()`. They
     /// must be listed — identified by interface name, FRR-style — and
@@ -7899,6 +8051,7 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
             missing_policy: Vec::new(),
             prefix_sid_discarded: 0,
             prefix_limits: Vec::new(),
+            default_originate: Vec::new(),
             prefix_overflow: None,
         }
     }

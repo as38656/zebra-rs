@@ -1575,6 +1575,20 @@ pub fn config_vrf_neighbor_afi_safi_llgr(
     super::afi_knob::set_llgr(&mut nbr.config, afi_safi, op)
 }
 
+/// `… afi-safi <af> default-originate` (presence).
+pub fn config_vrf_neighbor_afi_safi_default_originate(
+    bgp: &mut Bgp,
+    mut args: Args,
+    op: ConfigOp,
+) -> Option<()> {
+    let vrf = args.string()?;
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let cfg = vrf_entry(bgp, vrf, op)?;
+    let nbr = neighbor_entry(cfg, addr, op)?;
+    super::afi_knob::set_default_originate(&mut nbr.config, afi_safi, op)
+}
+
 /// `set router bgp vrf <NAME> afi-safi ipv4` — presence container.
 pub fn config_vrf_afi_ipv4(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
     let name = args.string()?;

@@ -348,6 +348,23 @@ module zebra-bgp-afi-knobs {
       }
     }
 
+    container default-originate {
+      ext:sort "90";
+      ext:help "Send a default route to this neighbor";
+      presence "Send a default route to this neighbor";
+      description
+        "Send the neighbor a default route, 0.0.0.0/0 or ::/0, with this
+         router as next hop (FRR `neighbor X default-originate`). The
+         route is not put in the Loc-RIB, so the FIB, the VPN and the
+         other neighbors do not get it. As in FRR, the outbound policy
+         and ebgp-requires-policy do not apply to it. While it is set,
+         a default route from the Loc-RIB is not sent to the neighbor.
+
+         Only ipv4 and ipv6 take it; another family is refused at
+         commit. A change is sent to the neighbor at the end of the
+         commit.";
+    }
+
     container long-lived-graceful-restart {
       ext:help "Per-family long-lived GR settings (RFC 9494)";
       description

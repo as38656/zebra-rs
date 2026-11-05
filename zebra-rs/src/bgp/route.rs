@@ -272,6 +272,9 @@ pub struct SyncCtx {
     /// enhe_next_hop`): the gate-on egress engines encode with it, and hold
     /// a route back while it is `Missing` (review finding #29).
     pub enhe: EnheNextHop,
+    /// `afi-safi ipv4 default-originate` is on: the peer gets its own
+    /// default, so the build keeps the Loc-RIB one back.
+    pub default_originate: bool,
 }
 
 /// The RFC 8950 extended next-hop for IPv4 unicast toward one peer: an
@@ -426,6 +429,7 @@ impl SyncCtx {
             attach_unknown_attr: None,
             as_sets_withdraw: true,
             enhe: EnheNextHop::Off,
+            default_originate: false,
         }
     }
 }
@@ -8019,6 +8023,13 @@ pub fn route_soft_out_peer(peer_idx: usize, bgp: &mut BgpTop, peers: &mut PeerMa
         (do_v4, do_v6, v4vpn_rds, v6vpn_rds, evpn_rds)
     };
 
+    // Before the table walks: a withdraw of the originated default must
+    // reach the peer ahead of the Loc-RIB default the walk sends (FRR).
+    if let Some(peer) = peers.get_mut_by_idx(peer_idx) {
+        for afi in [Afi::Ip, Afi::Ip6] {
+            super::default_originate::sync(peer, afi, bgp);
+        }
+    }
     if do_v4 {
         if super::group_egress::egress_group_task_enabled() {
             soft_out_v4_to_group(peer_idx, bgp, peers);
@@ -14678,6 +14689,7 @@ pub fn route_clean(
     }
     let peer = peers.get_mut_by_idx(peer_id).expect("peer must exist");
     peer.adj_out.v4.0.clear();
+    peer.default_originate.clear();
 
     // Clear the whole VPN advertise-cache state — forward map, reverse
     // map, AND the debounce timer — exactly like the EVPN teardown
@@ -15781,6 +15793,20 @@ pub fn route_update_ipv4(
     rib: &BgpRib,
     add_path: bool,
 ) -> Option<(Ipv4Nlri, BgpAttr)> {
+    if super::default_originate::holds_back(ctx.default_originate, prefix.prefix_len(), rib) {
+        return None;
+    }
+    egress_update_ipv4(ctx, prefix, rib, add_path)
+}
+
+/// The per-peer build of [`route_update_ipv4`], for any row: the
+/// originated default is built with it too.
+pub(super) fn egress_update_ipv4(
+    ctx: &SyncCtx,
+    prefix: &Ipv4Net,
+    rib: &BgpRib,
+    add_path: bool,
+) -> Option<(Ipv4Nlri, BgpAttr)> {
     // Split-horizon: Don't send route back to the peer that sent it
     if rib.ident == ctx.ident {
         return None;
@@ -15982,6 +16008,22 @@ pub fn route_update_ipv4(
 /// Outbound policy is not applied yet for v6 (the policy engine is
 /// `Ipv4Nlri`-typed) — same deferred gap as the ingest path.
 pub fn route_update_ipv6(
+    peer: &mut Peer,
+    prefix: &Ipv6Net,
+    rib: &BgpRib,
+    bgp: &mut BgpTop,
+    add_path: bool,
+) -> Option<(Ipv6Nlri, BgpAttr)> {
+    let statement = peer.default_originate_config(Afi::Ip6).is_some();
+    if super::default_originate::holds_back(statement, prefix.prefix_len(), rib) {
+        return None;
+    }
+    egress_update_ipv6(peer, prefix, rib, bgp, add_path)
+}
+
+/// The per-peer build of [`route_update_ipv6`], for any row: the
+/// originated default is built with it too.
+pub(super) fn egress_update_ipv6(
     peer: &mut Peer,
     prefix: &Ipv6Net,
     rib: &BgpRib,
@@ -19069,6 +19111,9 @@ pub fn route_sync(peer: &mut Peer, bgp: &mut BgpTop, v4_via_pool: bool) {
         peer.eor.insert(key, true);
         send_rtcv6_membership(peer, bgp);
         send_eor_rtcv6_unicast(peer);
+    }
+    for afi in [Afi::Ip, Afi::Ip6] {
+        super::default_originate::sync(peer, afi, bgp);
     }
     // Advertize. At N>1 the v4-unicast dump is shard-parallel (`DumpV4`,
     // broadcast by the caller after the FSM), so skip it here — except
@@ -34387,6 +34432,7 @@ mod as_sets_withdraw_tests {
             attach_unknown_attr: None,
             as_sets_withdraw: true,
             enhe: crate::bgp::route::EnheNextHop::Off,
+            default_originate: false,
         };
         let rib = BgpRib::new(
             2,
@@ -34450,6 +34496,7 @@ mod as_sets_withdraw_tests {
             attach_unknown_attr: None,
             as_sets_withdraw: false,
             enhe: crate::bgp::route::EnheNextHop::Off,
+            default_originate: false,
         };
 
         // A VPNv4 row learned from an iBGP RR client: the originating PE
@@ -34546,6 +34593,7 @@ mod as_sets_withdraw_tests {
             attach_unknown_attr: None,
             as_sets_withdraw: false,
             enhe: crate::bgp::route::EnheNextHop::Off,
+            default_originate: false,
         };
         // A plain v4-unicast row learned from eBGP (so the iBGP→iBGP
         // suppression doesn't apply), received next-hop 3.3.3.3.
@@ -34620,6 +34668,7 @@ mod as_sets_withdraw_tests {
             attach_unknown_attr: None,
             as_sets_withdraw: false,
             enhe: crate::bgp::route::EnheNextHop::Off,
+            default_originate: false,
         };
         let recv = Ipv4Addr::new(3, 3, 3, 3);
         let mut attr = attr_with_path("65001");

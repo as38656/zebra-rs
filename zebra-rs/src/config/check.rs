@@ -8,10 +8,13 @@
 //! dispatched: a step (YANG has none), or a decimal64 range or
 //! `fraction-digits` (libyang extracts neither).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use bgp_packet::AfiSafi;
+
 use super::Args;
+use crate::bgp::default_originate::supported_family;
 use crate::bgp::ethernet_segment::check_es_esi;
 use crate::bgp::prefix_limit::counted_family;
 use crate::flex_algo::check_max_link_loss;
@@ -73,9 +76,12 @@ pub fn prefix_limit_line(line: &str) -> bool {
 /// `warning-only true` with a non-zero `restart`, which ask for opposite
 /// things. One error per neighbor family and problem.
 pub fn prefix_limit(leaves: &[(String, Vec<String>)]) -> Vec<String> {
-    let mut families = BTreeMap::<PrefixLimitOwner, PrefixLimitLeaves>::new();
+    let mut families = BTreeMap::<NeighborFamily, PrefixLimitLeaves>::new();
     for (path, args) in leaves {
-        let Some((owner, leaf, value)) = PrefixLimitOwner::of(path, args) else {
+        let Some((owner, rest, values)) = NeighborFamily::of(path, args) else {
+            continue;
+        };
+        let (Some(leaf), [value]) = (rest.strip_prefix("maximum-prefix/"), values) else {
             continue;
         };
         let family = families.entry(owner).or_default();
@@ -87,48 +93,83 @@ pub fn prefix_limit(leaves: &[(String, Vec<String>)]) -> Vec<String> {
     }
     let mut errors = Vec::new();
     for (owner, family) in families {
-        let counted = Args(VecDeque::from([owner.afi_safi.clone()]))
-            .afi_safi()
-            .is_some_and(counted_family);
-        if !counted {
+        if !owner.family().is_some_and(counted_family) {
             errors.push(format!(
-                "{owner}: {} prefixes are not counted; use ipv4, ipv6, \
+                "{owner} maximum-prefix: {} prefixes are not counted; use ipv4, ipv6, \
                  label-v4, label-v6, vpnv4 or vpnv6",
                 owner.afi_safi
             ));
         }
         if family.warning_only && family.restart {
             errors.push(format!(
-                "{owner}: warning-only and restart cannot be used together"
+                "{owner} maximum-prefix: warning-only and restart cannot be used together"
             ));
         }
     }
     errors
 }
 
-const NEIGHBOR_PREFIX_LIMIT_PATH: &str = "/router/bgp/neighbor/afi-safi/maximum-prefix/";
-const VRF_NEIGHBOR_PREFIX_LIMIT_PATH: &str = "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/";
+/// The leaves of one `maximum-prefix` that can conflict.
+#[derive(Default)]
+struct PrefixLimitLeaves {
+    warning_only: bool,
+    restart: bool,
+}
 
-/// One `afi-safi <name> maximum-prefix` container: of a global neighbor
-/// when `vrf` is `None`.
+/// Whether a config line can carry a `default-originate` statement
+/// [`default_originate`] reads.
+pub fn default_originate_line(line: &str) -> bool {
+    line.ends_with(" default-originate") || line.contains(" default-originate ")
+}
+
+/// The `default-originate` statements among a config's
+/// [`default_originate_line`]s, as (callback path, arguments), on a family
+/// that does not take it. One error per neighbor family.
+pub fn default_originate(leaves: &[(String, Vec<String>)]) -> Vec<String> {
+    let families: BTreeSet<NeighborFamily> = leaves
+        .iter()
+        .filter_map(|(path, args)| {
+            let (owner, rest, _) = NeighborFamily::of(path, args)?;
+            (rest.split('/').next() == Some("default-originate")).then_some(owner)
+        })
+        .collect();
+    families
+        .into_iter()
+        .filter(|owner| !owner.family().is_some_and(supported_family))
+        .map(|owner| {
+            format!(
+                "{owner} default-originate: {} takes no default route; use ipv4 or ipv6",
+                owner.afi_safi
+            )
+        })
+        .collect()
+}
+
+const NEIGHBOR_FAMILY_PATH: &str = "/router/bgp/neighbor/afi-safi/";
+const VRF_NEIGHBOR_FAMILY_PATH: &str = "/router/bgp/vrf/neighbor/afi-safi/";
+
+/// One `afi-safi <name>` of a neighbor: of a global neighbor when `vrf` is
+/// `None`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PrefixLimitOwner {
+struct NeighborFamily {
     vrf: Option<String>,
     neighbor: String,
     afi_safi: String,
 }
 
-impl PrefixLimitOwner {
-    /// The owner, leaf name and value of a `maximum-prefix` leaf.
-    fn of<'a>(path: &'a str, args: &'a [String]) -> Option<(Self, &'a str, &'a str)> {
-        let (vrf, leaf, args) = if let Some(leaf) = path.strip_prefix(NEIGHBOR_PREFIX_LIMIT_PATH) {
-            (None, leaf, args)
+impl NeighborFamily {
+    /// The neighbor family of a callback under one, the rest of the
+    /// callback path (`maximum-prefix/max`) and the arguments after the
+    /// keys.
+    fn of<'a>(path: &'a str, args: &'a [String]) -> Option<(Self, &'a str, &'a [String])> {
+        let (vrf, rest, args) = if let Some(rest) = path.strip_prefix(NEIGHBOR_FAMILY_PATH) {
+            (None, rest, args)
         } else {
-            let leaf = path.strip_prefix(VRF_NEIGHBOR_PREFIX_LIMIT_PATH)?;
+            let rest = path.strip_prefix(VRF_NEIGHBOR_FAMILY_PATH)?;
             let (vrf, args) = args.split_first()?;
-            (Some(vrf.clone()), leaf, args)
+            (Some(vrf.clone()), rest, args)
         };
-        let [neighbor, afi_safi, value] = args else {
+        let [neighbor, afi_safi, values @ ..] = args else {
             return None;
         };
         let owner = Self {
@@ -136,29 +177,22 @@ impl PrefixLimitOwner {
             neighbor: neighbor.clone(),
             afi_safi: afi_safi.clone(),
         };
-        Some((owner, leaf, value.as_str()))
+        Some((owner, rest, values))
+    }
+
+    fn family(&self) -> Option<AfiSafi> {
+        Args(VecDeque::from([self.afi_safi.clone()])).afi_safi()
     }
 }
 
-impl fmt::Display for PrefixLimitOwner {
+impl fmt::Display for NeighborFamily {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "router bgp")?;
         if let Some(vrf) = &self.vrf {
             write!(f, " vrf {vrf}")?;
         }
-        write!(
-            f,
-            " neighbor {} afi-safi {} maximum-prefix",
-            self.neighbor, self.afi_safi
-        )
+        write!(f, " neighbor {} afi-safi {}", self.neighbor, self.afi_safi)
     }
-}
-
-/// The leaves of one owner that can conflict.
-#[derive(Default)]
-struct PrefixLimitLeaves {
-    warning_only: bool,
-    restart: bool,
 }
 
 /// A leaf value check: `Err` holds the reason, shown after the line.
@@ -386,6 +420,60 @@ mod tests {
         ));
         assert!(!prefix_limit_line(
             "router bgp neighbor 10.0.0.1 afi-safi ipv4 prefix-sid send true"
+        ));
+    }
+
+    const NBR_DEFAULT: &str = "/router/bgp/neighbor/afi-safi/default-originate";
+    const VRF_DEFAULT: &str = "/router/bgp/vrf/neighbor/afi-safi/default-originate";
+
+    /// Only IPv4 and IPv6 unicast take a default route. On another family
+    /// the statement would do nothing.
+    #[test]
+    fn default_originate_needs_ipv4_or_ipv6() {
+        for family in ["ipv4", "ipv6"] {
+            assert!(
+                default_originate(&[
+                    leaf(NBR_DEFAULT, &["10.0.0.1", family]),
+                    leaf(VRF_DEFAULT, &["red", "10.0.0.2", family]),
+                ])
+                .is_empty(),
+                "{family}"
+            );
+        }
+        assert_eq!(
+            default_originate(&[
+                leaf(NBR_DEFAULT, &["10.0.0.1", "vpnv4"]),
+                leaf(NBR_DEFAULT, &["10.0.0.1", "ipv4"]),
+                leaf(NBR_DEFAULT, &["10.0.0.3", "evpn"]),
+            ]),
+            vec![
+                "router bgp neighbor 10.0.0.1 afi-safi vpnv4 default-originate: \
+                 vpnv4 takes no default route; use ipv4 or ipv6"
+                    .to_string(),
+                "router bgp neighbor 10.0.0.3 afi-safi evpn default-originate: \
+                 evpn takes no default route; use ipv4 or ipv6"
+                    .to_string(),
+            ]
+        );
+        // Other statements of the family are not read.
+        assert!(
+            default_originate(&[leaf(
+                &format!("{NBR_LIMIT}/max"),
+                &["10.0.0.1", "evpn", "10"]
+            )])
+            .is_empty()
+        );
+        assert!(default_originate_line(
+            "router bgp neighbor 10.0.0.1 afi-safi ipv4 default-originate"
+        ));
+        assert!(default_originate_line(
+            "router bgp vrf red neighbor 10.0.0.2 afi-safi ipv6 default-originate"
+        ));
+        assert!(!default_originate_line(
+            "router ospf area 0.0.0.1 nssa-default-originate true"
+        ));
+        assert!(!default_originate_line(
+            "router bgp neighbor 10.0.0.1 afi-safi ipv4 maximum-prefix max 10"
         ));
     }
 

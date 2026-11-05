@@ -806,35 +806,36 @@ impl ConfigManager {
             "prefix-sid",
             "area-sid",
         ];
-        text.lines()
-            .filter(|line| LABEL_LINES.iter().any(|needle| line.contains(needle)))
-            .filter_map(|line| self.paths(line.to_string()))
-            .map(|paths| {
-                let (path, args) = path_from_command(&paths);
-                (path, args.0.into_iter().collect())
-            })
-            .collect()
+        self.leaves(text, |line| {
+            LABEL_LINES.iter().any(|needle| line.contains(needle))
+        })
     }
 
     /// The leaves among config `text`'s lines the E-Tree backend check reads
     /// (`check::etree_backend`), as callback paths and arguments.
     fn etree_backend_leaves(&self, text: &str) -> Vec<(String, Vec<String>)> {
-        text.lines()
-            .filter(|line| check::etree_backend_line(line))
-            .filter_map(|line| self.paths(line.to_string()))
-            .map(|paths| {
-                let (path, args) = path_from_command(&paths);
-                (path, args.0.into_iter().collect())
-            })
-            .collect()
+        self.leaves(text, check::etree_backend_line)
     }
 
     /// The leaves among config `text`'s lines the BGP `maximum-prefix`
     /// check reads (`check::prefix_limit`), as callback paths and
     /// arguments.
     fn prefix_limit_leaves(&self, text: &str) -> Vec<(String, Vec<String>)> {
+        self.leaves(text, check::prefix_limit_line)
+    }
+
+    /// The statements among config `text`'s lines the BGP
+    /// `default-originate` check reads (`check::default_originate`), as
+    /// callback paths and arguments.
+    fn default_originate_leaves(&self, text: &str) -> Vec<(String, Vec<String>)> {
+        self.leaves(text, check::default_originate_line)
+    }
+
+    /// Config `text`'s lines that `wanted` picks, as callback paths and
+    /// arguments. The other lines are not parsed.
+    fn leaves(&self, text: &str, wanted: impl Fn(&str) -> bool) -> Vec<(String, Vec<String>)> {
         text.lines()
-            .filter(|line| check::prefix_limit_line(line))
+            .filter(|line| wanted(line))
             .filter_map(|line| self.paths(line.to_string()))
             .map(|paths| {
                 let (path, args) = path_from_command(&paths);
@@ -911,6 +912,11 @@ impl ConfigManager {
         let prefix_limit = check::prefix_limit(&self.prefix_limit_leaves(&candidate));
         if !prefix_limit.is_empty() {
             return Err(anyhow::anyhow!(prefix_limit.join("\n")));
+        }
+        let default_originate =
+            check::default_originate(&self.default_originate_leaves(&candidate));
+        if !default_originate.is_empty() {
+            return Err(anyhow::anyhow!(default_originate.join("\n")));
         }
 
         // MPLS labels: a violation this commit would introduce, against
@@ -2877,6 +2883,73 @@ mod save_config_tests {
         let leaves = cm.prefix_limit_leaves(&candidate);
         assert_eq!(leaves.len(), 7, "{candidate}");
         assert_eq!(check::prefix_limit(&leaves), Vec::<String>::new());
+    }
+
+    /// `default-originate` on a family other than ipv4 and ipv6 fails the
+    /// commit. The per-VRF neighbor has only those two families.
+    #[test]
+    fn a_default_originate_on_another_family_fails_the_commit() {
+        let cm = manager_with_config(&temp_path("default-originate"));
+        let mode = cm.modes.get("configure").expect("configure mode");
+        for family in ["vpnv4", "evpn"] {
+            let af = format!("router bgp neighbor 10.0.0.1 afi-safi {family}");
+            for line in [
+                format!("{af} enabled true"),
+                format!("{af} default-originate"),
+            ] {
+                let (code, output, _) = cm.execute(mode, &format!("set {line}"));
+                assert_eq!(code, ExecCode::Show, "schema accepts `{line}`: {output:?}");
+            }
+            let err = cm.commit_config().expect_err(family).to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "{af} default-originate: {family} takes no default route; use ipv4 or ipv6"
+                )
+            );
+            let mut running = String::new();
+            cm.store.running.borrow().list(&mut running);
+            assert_eq!(running, "", "{family} must not reach the running config");
+            cm.store.discard();
+        }
+
+        // ipv4 and ipv6 pass. (Checked without committing: a commit would
+        // spawn BGP.)
+        let nbr_af = "router bgp neighbor 10.0.0.1 afi-safi ipv4";
+        let vrf_af = "router bgp vrf red neighbor 10.0.0.2 afi-safi ipv6";
+        for line in [
+            format!("{nbr_af} enabled true"),
+            format!("{nbr_af} default-originate"),
+            format!("{vrf_af} enabled true"),
+            format!("{vrf_af} default-originate"),
+        ] {
+            let (code, output, _) = cm.execute(mode, &format!("set {line}"));
+            assert_eq!(code, ExecCode::Show, "set rejected: {output:?}");
+        }
+        let mut candidate = String::new();
+        cm.store.candidate.borrow().list(&mut candidate);
+        let leaves = cm.default_originate_leaves(&candidate);
+        let leaf = |path: &str, args: &[&str]| {
+            (
+                path.to_string(),
+                args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            leaves,
+            vec![
+                leaf(
+                    "/router/bgp/neighbor/afi-safi/default-originate",
+                    &["10.0.0.1", "ipv4"]
+                ),
+                leaf(
+                    "/router/bgp/vrf/neighbor/afi-safi/default-originate",
+                    &["red", "10.0.0.2", "ipv6"]
+                ),
+            ],
+            "{candidate}"
+        );
+        assert_eq!(check::default_originate(&leaves), Vec::<String>::new());
     }
 
     /// `router bgp afi-safi evpn etree` is always in the schema (the

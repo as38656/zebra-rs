@@ -4276,6 +4276,22 @@ fn config_send_community_large(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Optio
     config_send_community(bgp, args, op, super::afi_knob::set_send_community_large)
 }
 
+/// `set/delete router bgp neighbor <addr> afi-safi <name>
+/// default-originate`. A change on an Established peer is sent at
+/// `CommitEnd`: the update-group signature moves the peer and the re-sync
+/// sends or withdraws the default.
+fn config_default_originate(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let peer = bgp.peers.get_mut(&addr)?;
+    let before = peer.default_originate_configs();
+    super::afi_knob::set_default_originate(&mut peer.config, afi_safi, op)?;
+    if peer.default_originate_configs() != before {
+        queue_egress_resync(bgp, addr);
+    }
+    Some(())
+}
+
 /// Queue an Established peer for the outbound re-sync at `CommitEnd`, for
 /// a knob that changes what every family of it sends.
 fn queue_egress_resync(bgp: &mut Bgp, addr: IpAddr) {
@@ -5950,6 +5966,10 @@ impl Bgp {
             super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_force,
         );
         self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/default-originate",
+            super::vrf_config::config_vrf_neighbor_afi_safi_default_originate,
+        );
+        self.callback_add(
             "/router/bgp/vrf/neighbor/afi-safi/policy/in",
             super::vrf_config::config_vrf_neighbor_afi_safi_policy_in,
         );
@@ -6206,6 +6226,7 @@ impl Bgp {
             "/afi-safi/maximum-prefix/force",
             config_maximum_prefix_force,
         );
+        self.callback_peer("/afi-safi/default-originate", config_default_originate);
         self.callback_peer(
             "/afi-safi/send-community/standard",
             config_send_community_standard,
