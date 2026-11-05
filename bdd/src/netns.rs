@@ -171,6 +171,21 @@ pub async fn create_bridge(bridge_name: &str) -> Result<()> {
     )
     .await?;
 
+    // By default the kernel answers ARP on any interface for any address of
+    // the host. With rp_filter and arp_filter off, an address on the host `lo`
+    // makes the host answer on this bridge with the bridge's MAC. A namespace
+    // then sends its packets to the bridge instead of the neighbor, and a
+    // session between loopbacks stays in Connect.
+    run_cmd(
+        &[
+            "sysctl",
+            "-qw",
+            &format!("net.ipv4.conf.{}.arp_ignore=1", bridge_name),
+        ],
+        &format!("Failed to set arp_ignore on bridge {}", bridge_name),
+    )
+    .await?;
+
     run_cmd(
         &["ip", "link", "set", bridge_name, "up"],
         &format!("Failed to bring up bridge {}", bridge_name),
@@ -187,53 +202,42 @@ pub async fn delete_bridge(bridge_name: &str) -> Result<()> {
     .await
 }
 
-/// Remove stray global-scope addresses left on the HOST loopback.
-///
-/// A router config that puts a `/32` on `interface lo` adds it to the
-/// loopback of whatever namespace the daemon runs in. When such a daemon
-/// leaks into — or is run by hand in — the host namespace, its loopback
-/// address persists on the host `lo` after teardown (deleting a netns
-/// can't reclaim an address that was added to the host's own `lo`). That
-/// stray address then poisons every later feature that peers over
-/// loopbacks across a bridge: the bridge lives in the host namespace, so
-/// when a namespace ARPs for its bridge-subnet next-hop the host answers
-/// for the leaked address with the bridge's MAC and silently black-holes
-/// one direction of the session — the peer wedges in Connect until the
-/// ~120s ConnectRetryTimer, far past any scenario wait. (Diagnosed on
-/// `@bgp_disable_connected_check`, whose z2→z1 loopback path died exactly
-/// this way against a stale `10.0.0.1/32` on the host `lo`.)
-///
-/// `scope global` excludes real loopback (127.0.0.0/8 and ::1 are scope
-/// host), so this only ever deletes leaked test addresses — there is no
-/// legitimate global address on a BDD host's `lo`.
-pub async fn sweep_host_loopback_addrs() -> Result<()> {
+/// A global address a test put on the host `lo`. Dropping it removes the
+/// address, also when a step of the scenario panicked.
+#[derive(Debug)]
+pub struct HostLoopbackAddr(String);
+
+impl HostLoopbackAddr {
+    /// Add `addr` to the host `lo`. This fails if `lo` already has it, so a
+    /// test never takes over an address that it did not add.
+    pub async fn add(addr: &str) -> Result<Self> {
+        run_cmd(
+            &["ip", "addr", "add", addr, "dev", "lo"],
+            &format!("Failed to add {} to the host lo", addr),
+        )
+        .await?;
+        Ok(Self(addr.to_string()))
+    }
+}
+
+impl Drop for HostLoopbackAddr {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("sudo")
+            .args(["ip", "addr", "del", &self.0, "dev", "lo"])
+            .status();
+    }
+}
+
+/// Whether the host `lo` has the address `addr`.
+pub async fn host_loopback_has_addr(addr: &str) -> Result<bool> {
     let output = Command::new("ip")
-        .args(["-o", "addr", "show", "dev", "lo", "scope", "global"])
+        .args(["-o", "addr", "show", "dev", "lo", "to", addr])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
         .context("Failed to list host loopback addresses")?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        // `N: lo    inet 10.0.0.1/32 scope global lo \ ...` — pull the
-        // CIDR token right after `inet` / `inet6`.
-        let mut tokens = line.split_whitespace();
-        while let Some(tok) = tokens.next() {
-            if tok == "inet" || tok == "inet6" {
-                if let Some(addr) = tokens.next() {
-                    let _ = run_cmd(
-                        &["ip", "addr", "del", addr, "dev", "lo"],
-                        &format!("Failed to delete stray host lo address {}", addr),
-                    )
-                    .await;
-                }
-                break;
-            }
-        }
-    }
-    Ok(())
+    Ok(!output.stdout.is_empty())
 }
 
 /// Create a veth pair and connect a namespace to a bridge.

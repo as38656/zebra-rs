@@ -22,6 +22,7 @@ pub struct World {
     /// offset — a line from an earlier run must never satisfy an
     /// assertion about the daemon started now.
     log_offsets: HashMap<String, u64>,
+    host_loopback_addrs: Vec<netns::HostLoopbackAddr>,
 }
 
 impl World {
@@ -206,15 +207,6 @@ async fn clean_test_environment(world: &mut World) {
         }
     }
 
-    // 5. Sweep stray global-scope addresses off the HOST loopback. Unlike
-    // the per-feature resources above this is host-global, but it is only
-    // ever leaked test addresses (a router `interface lo` /32 whose daemon
-    // ran in the host namespace) — never anything a live feature needs —
-    // so an unconditional sweep is safe and self-healing. A leaked address
-    // here makes the host answer ARP for a bridge subnet and black-holes
-    // loopback-peered sessions (see `sweep_host_loopback_addrs`).
-    let _ = netns::sweep_host_loopback_addrs().await;
-
     // Note: the shared daemon startup config `/etc/zebra-rs/zebra-rs.conf` is
     // deliberately NOT swept here. BDD daemons are launched with `-c /dev/null`
     // (see `netns::spawn_in_netns_env`), so each cold-starts from an empty
@@ -253,6 +245,24 @@ async fn connect_two_namespaces(
         .await
         .expect("Failed to connect namespace pair");
     println!("✓ Linked {}:{} <-> {}:{}", a, iface_a, b, iface_b);
+}
+
+#[given(expr = "the host loopback has address {string}")]
+async fn host_loopback_add_addr(world: &mut World, addr: String) {
+    let added = netns::HostLoopbackAddr::add(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    world.host_loopback_addrs.push(added);
+    println!("✓ Added {} to the host lo", addr);
+}
+
+#[then(expr = "the host loopback should have address {string}")]
+async fn host_loopback_has_addr(_world: &mut World, addr: String) {
+    let present = netns::host_loopback_has_addr(&addr)
+        .await
+        .expect("Failed to list host loopback addresses");
+    assert!(present, "{} is gone from the host lo", addr);
+    println!("✓ The host lo still has {}", addr);
 }
 
 #[when(expr = "I create bridge {string}")]
