@@ -34,7 +34,6 @@ fn parse_clear_bgp_path(
     peer::BgpClearOp,
 )> {
     use bgp_packet::{Afi, Safi};
-    use peer::BgpClearOp;
 
     let rest = path.strip_prefix("/clear/bgp/")?;
     let (afi_safi, tail) = if rest == "neighbor" || rest.starts_with("neighbor/") {
@@ -50,14 +49,26 @@ fn parse_clear_bgp_path(
         };
         (Some(pair), tail)
     };
-    let op = match tail {
-        "neighbor" => BgpClearOp::Hard,
-        "neighbor/soft" => BgpClearOp::SoftBoth,
-        "neighbor/soft/in" => BgpClearOp::SoftIn,
-        "neighbor/soft/out" => BgpClearOp::SoftOut,
-        _ => return None,
-    };
-    Some((afi_safi, op))
+    Some((afi_safi, parse_clear_op(tail)?))
+}
+
+/// The operation of a `neighbor[/soft[/in|out]]` clear path tail.
+fn parse_clear_op(tail: &str) -> Option<peer::BgpClearOp> {
+    use peer::BgpClearOp;
+    match tail {
+        "neighbor" => Some(BgpClearOp::Hard),
+        "neighbor/soft" => Some(BgpClearOp::SoftBoth),
+        "neighbor/soft/in" => Some(BgpClearOp::SoftIn),
+        "neighbor/soft/out" => Some(BgpClearOp::SoftOut),
+        _ => None,
+    }
+}
+
+/// The operation of a `/clear/bgp/vrf/neighbor[/soft[/in|out]]` path
+/// (`clear bgp vrf <name> <peer-or-all> …`), whose arguments are the
+/// VRF name and the peer.
+fn parse_clear_bgp_vrf_path(path: &str) -> Option<peer::BgpClearOp> {
+    parse_clear_op(path.strip_prefix("/clear/bgp/vrf/")?)
 }
 
 /// Tier 1b sync backpressure: park the IPv4 sync cursor once this many
@@ -1444,6 +1455,10 @@ pub struct Bgp {
     /// `config::finish_commit_regroup` at `CommitEnd`, which re-syncs each
     /// of them under its new egress transform.
     pub regroup_resync: std::collections::BTreeSet<usize>,
+    /// The `(peer, family)` pairs whose `maximum-prefix` changed in the
+    /// current commit, drained by `config::finish_commit_prefix_limits`
+    /// at `CommitEnd`.
+    pub prefix_limit_changes: std::collections::BTreeSet<(usize, bgp_packet::AfiSafi)>,
     /// Instance-wide conditional tracing config (zebra-bgp-tracing.yang
     /// `router bgp tracing`). Written by the tracing config dispatch;
     /// read by the gated `bgp_*_trace!` macros (follow-up).
@@ -1697,6 +1712,7 @@ impl Bgp {
             connected_subnets: super::connected::ConnectedSubnets::new(),
             update_groups: super::update_group::empty_map(),
             regroup_resync: std::collections::BTreeSet::new(),
+            prefix_limit_changes: std::collections::BTreeSet::new(),
             tracing: super::tracing::BgpTracing::default(),
             policy_tx,
             policy_rx: policy_chan.rx,
@@ -3746,6 +3762,7 @@ impl Bgp {
                 // peer that moved is re-synced under its new transform
                 // (review findings #4 / #21).
                 super::config::finish_commit_regroup(self);
+                super::config::finish_commit_prefix_limits(self);
             }
             ConfigOp::Completion => {
                 // `comps_dynamic` carries the dynamic handler name
@@ -3766,6 +3783,8 @@ impl Bgp {
                 let (path, mut args) = path_from_command(&msg.paths);
                 if let Some((afi_safi, op)) = parse_clear_bgp_path(&path) {
                     let _ = peer::clear_bgp_action(self, &mut args, afi_safi, op);
+                } else if let Some(op) = parse_clear_bgp_vrf_path(&path) {
+                    self.clear_bgp_vrf(&mut args, op);
                 } else if let Some(filter) = path.strip_prefix("/clear/bgp/evpn/dup-addr/vni") {
                     self.clear_evpn_dup_addr(filter, &mut args);
                 } else if let Some(action) = path.strip_prefix("/clear/bgp/debug/")
@@ -8002,13 +8021,48 @@ impl Bgp {
         }
     }
 
+    /// `clear bgp vrf <name> <peer-or-all> [soft [in|out]]`: the VRF's
+    /// task owns its CE peers, so the clear is handed to it.
+    fn clear_bgp_vrf(&self, args: &mut Args, op: peer::BgpClearOp) {
+        let (Some(vrf), Some(target)) = (args.string(), args.string()) else {
+            return;
+        };
+        if let Some(handle) = self.vrf_registry.get(&vrf) {
+            let _ = handle
+                .inbox
+                .send(super::vrf::msg::BgpVrfMsg::Clear { target, op });
+        }
+    }
+
+    /// Check `families` of peer `ident` against their `maximum-prefix`
+    /// limits now, and close the session when one is over.
+    pub(super) fn check_prefix_limits(&mut self, ident: usize, families: &[bgp_packet::AfiSafi]) {
+        let Some(peer) = self.peers.get_mut_by_idx(ident) else {
+            return;
+        };
+        if let Some(exceeded) = peer.prefix_limit_check(&self.shard, families) {
+            self.process_msg(Message::Event(ident, Event::PrefixLimitExceeded(exceeded)));
+        }
+    }
+
+    /// One worker result: the reduce below, then the IPv4 unicast
+    /// `maximum-prefix` check of the peer the work was for.
+    fn process_shard_result(&mut self, result: super::shard::pool::ShardResult) {
+        let peer = result.peer;
+        self.reduce_shard_result(result);
+        if let Some(ident) = peer {
+            let v4 = bgp_packet::AfiSafi::new(bgp_packet::Afi::Ip, bgp_packet::Safi::Unicast);
+            self.check_prefix_limits(ident, &[v4]);
+        }
+    }
+
     /// Reduce side of the shard pool: act on one worker's best-path
     /// deltas — NHT untrack + FIB install per delta, then the advertise
     /// out-policy + attribute transform precomputed in parallel across the
     /// batch (Phase E.1), then serial bucketing — via the same post-work
     /// the synchronous path runs. Reachable only at N>1, where
     /// v4-unicast ingest fanned out to the pool.
-    fn process_shard_result(&mut self, result: super::shard::pool::ShardResult) {
+    fn reduce_shard_result(&mut self, result: super::shard::pool::ShardResult) {
         // A2 step ③ — peel the DumpV4 barrier acks off the delta stream.
         // For each shard's `DumpDoneV4`: record what it advertised into the
         // peer's Adj-RIB-Out (so a later withdraw reaches the peer),
@@ -8891,6 +8945,31 @@ mod tests {
         }
     }
 
+    /// `clear bgp vrf <name> …` maps to the same operations, and is not
+    /// taken for an AFI.
+    #[test]
+    fn clear_bgp_vrf_path_mapping() {
+        use crate::bgp::peer::BgpClearOp;
+
+        for (path, want) in [
+            ("/clear/bgp/vrf/neighbor", Some(BgpClearOp::Hard)),
+            ("/clear/bgp/vrf/neighbor/soft", Some(BgpClearOp::SoftBoth)),
+            ("/clear/bgp/vrf/neighbor/soft/in", Some(BgpClearOp::SoftIn)),
+            (
+                "/clear/bgp/vrf/neighbor/soft/out",
+                Some(BgpClearOp::SoftOut),
+            ),
+            ("/clear/bgp/vrf/bogus", None),
+            ("/clear/bgp/neighbor", None),
+        ] {
+            assert_eq!(super::parse_clear_bgp_vrf_path(path), want, "path `{path}`");
+            assert_eq!(
+                super::parse_clear_bgp_path(path).is_some(),
+                path == "/clear/bgp/neighbor"
+            );
+        }
+    }
+
     #[test]
     fn srv6_l3_service_prefix_sid_round_trips_to_end_dt46() {
         use bgp_packet::{AttrEmitter, ParseBe};
@@ -9624,3 +9703,7 @@ mod fib_pending_dump_review_tests;
 #[cfg(test)]
 #[path = "attr_intern_tests.rs"]
 mod attr_intern_tests;
+
+#[cfg(test)]
+#[path = "prefix_limit_tests.rs"]
+mod prefix_limit_tests;

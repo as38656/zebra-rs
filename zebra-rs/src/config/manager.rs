@@ -829,6 +829,20 @@ impl ConfigManager {
             .collect()
     }
 
+    /// The leaves among config `text`'s lines the BGP `maximum-prefix`
+    /// check reads (`check::prefix_limit`), as callback paths and
+    /// arguments.
+    fn prefix_limit_leaves(&self, text: &str) -> Vec<(String, Vec<String>)> {
+        text.lines()
+            .filter(|line| check::prefix_limit_line(line))
+            .filter_map(|line| self.paths(line.to_string()))
+            .map(|paths| {
+                let (path, args) = path_from_command(&paths);
+                (path, args.0.into_iter().collect())
+            })
+            .collect()
+    }
+
     /// Commit the candidate. Refuses it, dispatching nothing, when it
     /// fails validation: mandatory nodes, the leaf value checks, or a label
     /// check it would newly break.
@@ -890,6 +904,13 @@ impl ConfigManager {
             for error in &etree {
                 tracing::warn!("startup config: {error}");
             }
+        }
+
+        // No earlier release took `maximum-prefix`, so a startup config
+        // is held to this as strictly as a commit.
+        let prefix_limit = check::prefix_limit(&self.prefix_limit_leaves(&candidate));
+        if !prefix_limit.is_empty() {
+            return Err(anyhow::anyhow!(prefix_limit.join("\n")));
         }
 
         // MPLS labels: a violation this commit would introduce, against
@@ -2761,6 +2782,103 @@ mod save_config_tests {
         }
     }
 
+    /// `maximum-prefix` on the global and the per-VRF neighbor: `max` is
+    /// required, `warning-only` and a non-zero `restart` exclude each
+    /// other, and only the counted families take a limit. Each such
+    /// statement fails the commit.
+    #[test]
+    fn a_maximum_prefix_that_cannot_apply_fails_the_commit() {
+        let cm = manager_with_config(&temp_path("maximum-prefix"));
+        let mode = cm.modes.get("configure").expect("configure mode");
+        let nbr_af = "router bgp neighbor 10.0.0.1 afi-safi ipv4";
+        let nbr = format!("{nbr_af} maximum-prefix");
+        let evpn_af = "router bgp neighbor 10.0.0.1 afi-safi evpn";
+        let vrf_af = "router bgp vrf red neighbor 10.0.0.2 afi-safi ipv6";
+        let vrf = format!("{vrf_af} maximum-prefix");
+        let conflict = "warning-only and restart cannot be used together";
+        for (lines, reason) in [
+            (
+                vec![
+                    format!("{nbr_af} enabled true"),
+                    format!("{nbr} threshold 50"),
+                ],
+                "missing mandatory node 'max'",
+            ),
+            (
+                vec![
+                    format!("{nbr_af} enabled true"),
+                    format!("{nbr} max 10"),
+                    format!("{nbr} warning-only true"),
+                    format!("{nbr} restart 5"),
+                ],
+                conflict,
+            ),
+            (
+                vec![
+                    format!("{vrf_af} enabled true"),
+                    format!("{vrf} max 10"),
+                    format!("{vrf} warning-only true"),
+                    format!("{vrf} restart 5"),
+                ],
+                conflict,
+            ),
+            (
+                vec![
+                    format!("{evpn_af} enabled true"),
+                    format!("{evpn_af} maximum-prefix max 10"),
+                ],
+                "evpn prefixes are not counted",
+            ),
+        ] {
+            for line in &lines {
+                let (code, output, _) = cm.execute(mode, &format!("set {line}"));
+                assert_eq!(code, ExecCode::Show, "schema accepts `{line}`: {output:?}");
+            }
+            let err = cm.commit_config().expect_err(reason).to_string();
+            assert!(err.contains(reason), "{lines:?}: {err}");
+            let mut running = String::new();
+            cm.store.running.borrow().list(&mut running);
+            assert_eq!(running, "", "{lines:?} must not reach the running config");
+            cm.store.discard();
+        }
+
+        // Out of range for the schema itself.
+        for line in [
+            format!("{nbr} max 0"),
+            format!("{nbr} threshold 0"),
+            format!("{nbr} threshold 101"),
+            format!("{nbr} restart 65536"),
+        ] {
+            let (code, output, _) = cm.execute(mode, &format!("set {line}"));
+            assert_ne!(code, ExecCode::Show, "`{line}` must not parse: {output:?}");
+        }
+
+        // A complete limit passes. (Checked without committing: a commit
+        // would spawn BGP.)
+        for line in [
+            format!("{nbr_af} enabled true"),
+            format!("{nbr} max 10"),
+            format!("{nbr} threshold 90"),
+            format!("{nbr} warning-only true"),
+            format!("{nbr} restart 0"),
+            format!("{nbr} force true"),
+            format!("{vrf_af} enabled true"),
+            format!("{vrf} max 20"),
+            format!("{vrf} restart 1"),
+        ] {
+            let (code, output, _) = cm.execute(mode, &format!("set {line}"));
+            assert_eq!(code, ExecCode::Show, "set rejected: {output:?}");
+        }
+        let mut candidate = String::new();
+        cm.store.candidate.borrow().list(&mut candidate);
+        let mut errors = Vec::new();
+        cm.store.candidate.borrow().validate(&mut errors);
+        assert_eq!(errors, Vec::<String>::new(), "{candidate}");
+        let leaves = cm.prefix_limit_leaves(&candidate);
+        assert_eq!(leaves.len(), 7, "{candidate}");
+        assert_eq!(check::prefix_limit(&leaves), Vec::<String>::new());
+    }
+
     /// `router bgp afi-safi evpn etree` is always in the schema (the
     /// `etree` feature no longer gates it), and a leaf AC is refused at
     /// commit without the cradle data plane: the kernel bridge cannot keep
@@ -4045,6 +4163,49 @@ mod yang_load_tests {
                 Some(want_arg0),
                 "spec arg for: {cmd}"
             );
+        }
+    }
+
+    /// `clear bgp vrf <name> <peer-or-all> [soft [in|out]]`, with or
+    /// without the `neighbor` keyword, reaches one path whose arguments
+    /// are the VRF and the peer.
+    #[test]
+    fn bgp_clear_vrf_paths_parse() {
+        use crate::config::ExecCode;
+        use crate::config::parse::{State, parse};
+        use libyang::to_entry;
+
+        let mut yang = YangStore::new();
+        yang.add_path(concat!(env!("CARGO_MANIFEST_DIR"), "/yang"));
+        yang.read_with_resolve("configure")
+            .unwrap_or_else(|e| panic!("configure failed to load: {e:#}"));
+        yang.identity_resolve();
+        let module = yang.find_module("configure").unwrap();
+        let entry = to_entry(&yang, module);
+
+        for (cmd, want_path, want_peer) in [
+            (
+                "clear bgp vrf red neighbor 10.0.0.2",
+                "/clear/bgp/vrf/neighbor",
+                "10.0.0.2",
+            ),
+            (
+                "clear bgp vrf red 10.0.0.2",
+                "/clear/bgp/vrf/neighbor",
+                "10.0.0.2",
+            ),
+            (
+                "clear bgp vrf red all soft in",
+                "/clear/bgp/vrf/neighbor/soft/in",
+                "all",
+            ),
+        ] {
+            let (code, _comps, state) = parse(cmd, entry.clone(), None, State::new());
+            assert_eq!(code, ExecCode::Success, "should parse: {cmd}");
+            let (path, mut args) = crate::config::path_from_command(&state.paths);
+            assert_eq!(path, want_path, "path for: {cmd}");
+            assert_eq!(args.string().as_deref(), Some("red"), "vrf for: {cmd}");
+            assert_eq!(args.string().as_deref(), Some(want_peer), "peer for: {cmd}");
         }
     }
 

@@ -158,6 +158,18 @@ module zebra-bgp-clear {
         ext:default-child "neighbor";
         uses bgp-clear-neighbor-actions;
       }
+      // `clear bgp vrf <name> <peer-or-all> [soft [in|out]]`: the CE
+      // neighbors of one `router bgp vrf`.
+      list vrf {
+        ext:help "Clear BGP neighbors of a VRF";
+        key name;
+        leaf name {
+          ext:help "VRF name";
+          type string;
+        }
+        ext:default-child "neighbor";
+        uses bgp-clear-neighbor-actions;
+      }
       container evpn {
         ext:help "L2VPN EVPN (RFC 7432)";
         ext:default-child "neighbor";

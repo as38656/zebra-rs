@@ -2058,6 +2058,36 @@ mod tests {
         assert_ne!(a, b, "next-hop-self and next-hop-unchanged differ");
     }
 
+    /// `maximum-prefix` limits what a peer sends us, not what we send it,
+    /// so it never splits an update-group.
+    #[test]
+    fn maximum_prefix_does_not_shard_the_group() {
+        use super::super::prefix_limit::PrefixLimitConfig;
+
+        let plain = sig_peer("10.0.0.1");
+        let mut limited = sig_peer("10.0.0.2");
+        for (afi, safi) in [(Afi::Ip6, Safi::Unicast), (Afi::Ip, Safi::MplsVpn)] {
+            limited
+                .config
+                .sub
+                .entry(AfiSafi::new(afi, safi))
+                .or_default()
+                .prefix_limit = PrefixLimitConfig {
+                max: Some(10),
+                warning_only: true,
+                force: true,
+                ..Default::default()
+            };
+        }
+        for (afi, safi) in [(Afi::Ip6, Safi::Unicast), (Afi::Ip, Safi::MplsVpn)] {
+            assert_eq!(
+                signature_of(&plain, afi, safi).unwrap(),
+                signature_of(&limited, afi, safi).unwrap(),
+                "{afi:?}/{safi:?}"
+            );
+        }
+    }
+
     /// Review finding #3: the unicast `next-hop-self` / `next-hop-unchanged`
     /// knobs select the NEXT_HOP of IPv4- and IPv6-unicast advertisements
     /// but were missing from the signature, so an iBGP peer with

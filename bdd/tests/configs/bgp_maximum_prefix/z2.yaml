@@ -1,0 +1,33 @@
+# z2 (AS 65002) sends five routes to z1. It traces NOTIFICATION messages
+# so the log shows the Cease that z1 sends over the limit.
+interface:
+- if-name: z1
+  ipv4:
+    address: 192.168.0.2/24
+router:
+  bgp:
+    tracing:
+      packet:
+        notification: null
+    global:
+      as: 65002
+      router-id: 192.168.0.2
+    timer:
+      adv-interval:
+        ebgp: 1
+    neighbor:
+    - remote-address: 192.168.0.1
+      remote-as: 65001
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    afi-safi:
+    - name: ipv4
+      network:
+      - prefix: 10.0.2.1/32
+      - prefix: 10.0.2.2/32
+      - prefix: 10.0.2.3/32
+      - prefix: 10.0.2.4/32
+      - prefix: 10.0.2.5/32

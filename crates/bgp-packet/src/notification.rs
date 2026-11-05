@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use super::{BGP_HEADER_LEN, BgpHeader, BgpType};
+use super::{Afi, BGP_HEADER_LEN, BgpHeader, BgpType, Safi};
 use bytes::{BufMut, BytesMut};
 use nom::bytes::complete::take;
 use nom::{IResult, number::complete::be_u8};
@@ -29,10 +29,12 @@ impl Display for NotificationPacket {
             // The operator's own words for why the session went down
             // (RFC 9003) — the whole reason the Data field is worth keeping.
             writeln!(f, " Shutdown Communication: {msg}")?;
+        } else if let Some(max_prefix) = self.max_prefix_data() {
+            writeln!(f, " Maximum Prefixes: {max_prefix}")?;
         } else if !self.data.is_empty() {
-            // Everything else — RFC 4486 Maximum Prefixes' AFI/SAFI and count,
-            // or the offending octets of the attribute the peer objected to —
-            // has no decoder here, so show it raw rather than drop it again.
+            // Everything else — such as the offending octets of the attribute
+            // the peer objected to — has no decoder here, so show it raw
+            // rather than drop it again.
             writeln!(f, " Data: {}", data_hex(&self.data))?;
         }
         Ok(())
@@ -421,6 +423,45 @@ fn sub_route_refresh_error_str(sub_code: RouteRefreshError) -> String {
     }
 }
 
+/// The Data of a Cease NOTIFICATION with subcode Maximum Number of
+/// Prefixes Reached (RFC 4486 §4): the family whose limit was exceeded
+/// and the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxPrefixData {
+    pub afi: Afi,
+    pub safi: Safi,
+    pub limit: u32,
+}
+
+impl MaxPrefixData {
+    const LEN: usize = 7;
+
+    /// AFI (2 octets), SAFI (1 octet), limit (4 octets).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(Self::LEN);
+        data.extend_from_slice(&u16::from(self.afi).to_be_bytes());
+        data.push(u8::from(self.safi));
+        data.extend_from_slice(&self.limit.to_be_bytes());
+        data
+    }
+
+    /// The fields of `data`, or `None` unless it is exactly seven octets.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let data: &[u8; Self::LEN] = data.try_into().ok()?;
+        Some(Self {
+            afi: Afi::from(u16::from_be_bytes([data[0], data[1]])),
+            safi: Safi::from(data[2]),
+            limit: u32::from_be_bytes([data[3], data[4], data[5], data[6]]),
+        })
+    }
+}
+
+impl Display for MaxPrefixData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}, limit {}", self.afi, self.safi, self.limit)
+    }
+}
+
 impl NotificationPacket {
     pub fn new(code: NotifyCode, sub_code: u8, data: Vec<u8>) -> Self {
         Self {
@@ -429,6 +470,29 @@ impl NotificationPacket {
             sub_code,
             data,
         }
+    }
+
+    /// Cease / Maximum Number of Prefixes Reached (RFC 4486 §4).
+    pub fn max_prefix_reached(data: MaxPrefixData) -> Self {
+        Self::new(
+            NotifyCode::Cease,
+            CeaseError::MaximumNumberOfPrefixReached.into(),
+            data.to_bytes(),
+        )
+    }
+
+    /// The family and limit of a Cease / Maximum Number of Prefixes
+    /// Reached, when its Data is well formed.
+    pub fn max_prefix_data(&self) -> Option<MaxPrefixData> {
+        let max_prefix = self.code == NotifyCode::Cease
+            && matches!(
+                CeaseError::from(self.sub_code),
+                CeaseError::MaximumNumberOfPrefixReached
+            );
+        if !max_prefix {
+            return None;
+        }
+        MaxPrefixData::parse(&self.data)
     }
 }
 
@@ -592,6 +656,59 @@ mod tests {
         assert!(
             parsed.shutdown_communication().is_some(),
             "rendered lossily, not dropped"
+        );
+    }
+
+    /// RFC 4486 §4: the Data of Cease/Maximum Number of Prefixes Reached is
+    /// AFI (2 octets), SAFI (1 octet) and the limit (4 octets).
+    #[test]
+    fn max_prefix_data_round_trips() {
+        let data = MaxPrefixData {
+            afi: Afi::Ip6,
+            safi: Safi::MplsVpn,
+            limit: 100_000,
+        };
+        let packet = NotificationPacket::max_prefix_reached(data);
+        assert_eq!(packet.code, NotifyCode::Cease);
+        assert_eq!(packet.sub_code, 1);
+        assert_eq!(packet.data, vec![0, 2, 128, 0x00, 0x01, 0x86, 0xa0]);
+
+        let buf: BytesMut = packet.into();
+        let (_, parsed) = NotificationPacket::parse_packet(&buf).expect("must parse");
+        assert_eq!(parsed.max_prefix_data(), Some(data));
+        assert!(
+            parsed.to_string().contains("IPv6 MPLS VPN, limit 100000"),
+            "Display decodes it: {parsed}"
+        );
+    }
+
+    /// The decoder applies to Cease subcode 1 with exactly seven octets;
+    /// anything else is not read as a family and a limit.
+    #[test]
+    fn max_prefix_data_only_for_its_subcode_and_length() {
+        let seven = [0, 1, 1, 0, 0, 0, 5];
+        let buf = wire(6, 2, &seven);
+        let (_, parsed) = NotificationPacket::parse_packet(&buf).unwrap();
+        assert_eq!(parsed.max_prefix_data(), None, "other Cease subcode");
+
+        let buf = wire(3, 1, &seven);
+        let (_, parsed) = NotificationPacket::parse_packet(&buf).unwrap();
+        assert_eq!(parsed.max_prefix_data(), None, "not a Cease");
+
+        let buf = wire(6, 1, &seven[..6]);
+        let (_, parsed) = NotificationPacket::parse_packet(&buf).unwrap();
+        assert_eq!(parsed.max_prefix_data(), None, "too short");
+        assert!(parsed.to_string().contains("Data: 00 01 01 00 00 00"));
+
+        let buf = wire(6, 1, &seven);
+        let (_, parsed) = NotificationPacket::parse_packet(&buf).unwrap();
+        assert_eq!(
+            parsed.max_prefix_data(),
+            Some(MaxPrefixData {
+                afi: Afi::Ip,
+                safi: Safi::Unicast,
+                limit: 5,
+            })
         );
     }
 

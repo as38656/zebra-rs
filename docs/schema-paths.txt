@@ -171,6 +171,12 @@
 /router/bgp/neighbor/afi-safi/long-lived-graceful-restart	container
 /router/bgp/neighbor/afi-safi/long-lived-graceful-restart/enabled	leaf
 /router/bgp/neighbor/afi-safi/long-lived-graceful-restart/restart-time	leaf
+/router/bgp/neighbor/afi-safi/maximum-prefix	container
+/router/bgp/neighbor/afi-safi/maximum-prefix/force	leaf
+/router/bgp/neighbor/afi-safi/maximum-prefix/max	leaf
+/router/bgp/neighbor/afi-safi/maximum-prefix/restart	leaf
+/router/bgp/neighbor/afi-safi/maximum-prefix/threshold	leaf
+/router/bgp/neighbor/afi-safi/maximum-prefix/warning-only	leaf
 /router/bgp/neighbor/afi-safi/next-hop-self	leaf
 /router/bgp/neighbor/afi-safi/next-hop-unchanged	leaf
 /router/bgp/neighbor/afi-safi/policy	container
@@ -377,6 +383,12 @@
 /router/bgp/vrf/neighbor/afi-safi/long-lived-graceful-restart	container
 /router/bgp/vrf/neighbor/afi-safi/long-lived-graceful-restart/enabled	leaf
 /router/bgp/vrf/neighbor/afi-safi/long-lived-graceful-restart/restart-time	leaf
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix	container
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/force	leaf
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/max	leaf
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/restart	leaf
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/threshold	leaf
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/warning-only	leaf
 /router/bgp/vrf/neighbor/afi-safi/next-hop-self	leaf
 /router/bgp/vrf/neighbor/afi-safi/next-hop-unchanged	leaf
 /router/bgp/vrf/neighbor/afi-safi/policy	container

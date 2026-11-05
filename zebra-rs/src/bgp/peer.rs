@@ -32,8 +32,14 @@ use crate::{bgp_fsm_trace, bgp_packet_trace};
 
 use super::cap::{CapAfiMap, cap_addpath_recv, cap_register_send};
 use super::inst::Message;
+use super::prefix_limit::{
+    PrefixCounts, PrefixLimit, PrefixLimitConfig, PrefixLimitEvent, PrefixLimitExceeded,
+    PrefixLimitState, PrefixOverflow,
+};
 use super::route::LocalRib;
 use super::route::route_from_peer;
+use super::shard::BgpShard;
+use super::shard::prefix_gauge::PoolPrefixGauge;
 use super::{BGP_PORT, PolicyListValue, PrefixSetValue};
 use super::{Bgp, BgpAttrStore, InOuts};
 
@@ -177,6 +183,22 @@ pub enum Event {
     AdvTimerVpnv4Expires,
     AdvTimerVpnv6Expires,
     AdvTimerEvpnExpires,
+    /// A family went over its `maximum-prefix` limit: send Cease /
+    /// Maximum Number of Prefixes Reached (RFC 4486 §4) and keep the
+    /// peer down.
+    PrefixLimitExceeded(PrefixLimitExceeded),
+    /// The `maximum-prefix restart` time of a peer kept down has passed.
+    PrefixLimitRestart,
+}
+
+impl Event {
+    /// Whether the event makes an idle or waiting peer dial.
+    fn starts_connection(&self) -> bool {
+        matches!(
+            self,
+            Event::Start | Event::IdleHoldTimerExpires | Event::ConnRetryTimerExpires
+        )
+    }
 }
 
 /// Why the last established session ended — FRR's `PEER_DOWN_*`
@@ -206,6 +228,8 @@ pub enum PeerDownReason {
     /// Our BGP router-id changed: the session is reset so the neighbor
     /// learns the new identifier from our next OPEN.
     RouterIdChange,
+    /// The neighbor sent more prefixes than its `maximum-prefix`.
+    PrefixLimit,
     /// The FSM left Established on an event with no self-evident cause.
     Unknown,
 }
@@ -222,6 +246,7 @@ impl PeerDownReason {
             Self::AdminReset => "Admin. reset",
             Self::ConfigChange => "Config change",
             Self::RouterIdChange => "Router ID changed",
+            Self::PrefixLimit => "Reached received prefix count",
             Self::Unknown => "Unknown",
         }
     }
@@ -238,6 +263,7 @@ impl PeerDownReason {
             Event::ConnFail(_) | Event::DialFail => Some(Self::ConnectionFailed),
             Event::NotifMsg(..) => Some(Self::NotificationReceived),
             Event::UpdateError(..) => Some(Self::UpdateError),
+            Event::PrefixLimitExceeded(..) => Some(Self::PrefixLimit),
             _ => None,
         }
     }
@@ -938,6 +964,9 @@ pub struct PeerSubConfig {
     pub prefix_sid: super::attr_filter::PrefixSidBoundary,
     /// `afi-safi <name> send-community {standard,extended,large}`.
     pub send_community: super::attr_filter::SendCommunity,
+    /// `afi-safi <name> maximum-prefix`. Read through
+    /// [`Peer::prefix_limit_of`].
+    pub prefix_limit: PrefixLimitConfig,
 }
 
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -1163,6 +1192,14 @@ pub struct Peer {
     /// UPDATEs whose BGP Prefix-SID attribute was discarded on receipt
     /// (RFC 8669 §4: external session, family not configured to accept).
     pub prefix_sid_discarded: u64,
+    /// The `maximum-prefix` warnings this session has given, per family.
+    /// Cleared when the session ends and when the family's limit changes.
+    pub prefix_limit: BTreeMap<AfiSafi, PrefixLimitState>,
+    /// Set while the peer is kept down for going over a limit.
+    pub prefix_overflow: Option<PrefixOverflow>,
+    /// This session's IPv4 unicast counts while the pool workers hold
+    /// the routes (N>1). `None` at N=1 and between sessions.
+    pub prefix_gauge: Option<Arc<PoolPrefixGauge>>,
     pub peer_type: PeerType,
     /// The instance that owns this peer: the global `router bgp`, or a
     /// `router bgp vrf` task for a CE peer.
@@ -1447,6 +1484,9 @@ impl Peer {
             otc_role_mismatch: None,
             otc_denied: [0; 2],
             prefix_sid_discarded: 0,
+            prefix_limit: BTreeMap::new(),
+            prefix_overflow: None,
+            prefix_gauge: None,
             peer_type: PeerType::IBGP,
             instance: PeerInstance::Global,
             ebgp_requires_policy: super::policy::EbgpRequiresPolicy::default(),
@@ -1623,6 +1663,126 @@ impl Peer {
             timer::update_timers(self);
             self.active = true;
         }
+    }
+
+    /// The `maximum-prefix` limit in force for `afi_safi`, if any.
+    pub fn prefix_limit_of(&self, afi_safi: AfiSafi) -> Option<PrefixLimit> {
+        self.config.sub.get(&afi_safi)?.prefix_limit.limit()
+    }
+
+    /// Every `maximum-prefix` limit in force, by family.
+    pub fn prefix_limits(&self) -> BTreeMap<AfiSafi, PrefixLimit> {
+        self.config
+            .sub
+            .iter()
+            .filter_map(|(afi_safi, sub)| Some((*afi_safi, sub.prefix_limit.limit()?)))
+            .collect()
+    }
+
+    /// Take a changed `maximum-prefix` of `afi_safi` into the session:
+    /// its warnings are given again, and the pool workers gate on it.
+    pub fn prefix_limit_changed(&mut self, afi_safi: AfiSafi) {
+        self.prefix_limit.remove(&afi_safi);
+        if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast)
+            && let Some(gauge) = &self.prefix_gauge
+        {
+            gauge.set_gate(self.prefix_limit_of(afi_safi).as_ref());
+        }
+    }
+
+    /// This session's `maximum-prefix` counts of `afi_safi`: from the
+    /// pool workers for IPv4 unicast at N>1, from `shard` otherwise.
+    pub fn prefix_counts(&self, shard: &BgpShard, afi_safi: AfiSafi) -> PrefixCounts {
+        match &self.prefix_gauge {
+            Some(gauge) if afi_safi == AfiSafi::new(Afi::Ip, Safi::Unicast) => gauge.counts(),
+            _ => shard.prefix_counts(self.ident, afi_safi),
+        }
+    }
+
+    /// Check the counts of `families` against their limits, and log each
+    /// warning once per crossing. Returns how the session ends when a
+    /// family is over a limit that closes it.
+    pub fn prefix_limit_check(
+        &mut self,
+        shard: &BgpShard,
+        families: &[AfiSafi],
+    ) -> Option<PrefixLimitExceeded> {
+        if !self.state.is_established() {
+            return None;
+        }
+        if let Some(exceeded) = self.prefix_gauge_tripped() {
+            return Some(exceeded);
+        }
+        for &afi_safi in families {
+            let Some(limit) = self.prefix_limit_of(afi_safi) else {
+                continue;
+            };
+            let count = self.prefix_counts(shard, afi_safi).counted(limit.counting);
+            let event = self
+                .prefix_limit
+                .entry(afi_safi)
+                .or_default()
+                .observe(&limit, count);
+            match event {
+                Some(PrefixLimitEvent::ThresholdReached) => tracing::warn!(
+                    peer = %self.display_name(),
+                    afi = %afi_safi.afi,
+                    safi = %afi_safi.safi,
+                    count,
+                    max = limit.max,
+                    threshold = limit.threshold,
+                    "bgp: maximum-prefix warning threshold reached",
+                ),
+                Some(PrefixLimitEvent::LimitWarning) => tracing::warn!(
+                    peer = %self.display_name(),
+                    afi = %afi_safi.afi,
+                    safi = %afi_safi.safi,
+                    count,
+                    max = limit.max,
+                    "bgp: maximum-prefix exceeded (warning-only, the session stays up)",
+                ),
+                Some(PrefixLimitEvent::Exceeded) => return limit.exceeded(afi_safi, count),
+                None => {}
+            }
+        }
+        None
+    }
+
+    /// How the session ends when a pool worker closed its gauge: the
+    /// count went over the gate at that moment, whatever it is now.
+    fn prefix_gauge_tripped(&self) -> Option<PrefixLimitExceeded> {
+        let trip = self.prefix_gauge.as_ref()?.tripped()?;
+        let afi_safi = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let restart = self
+            .prefix_limit_of(afi_safi)
+            .and_then(|limit| limit.exceeded(afi_safi, trip.count))
+            .and_then(|exceeded| exceeded.restart);
+        Some(PrefixLimitExceeded {
+            afi_safi,
+            count: trip.count,
+            max: trip.max,
+            restart,
+        })
+    }
+
+    /// End the hold of a peer kept down for going over a limit, so it
+    /// connects again. Returns whether it was held.
+    pub fn release_prefix_overflow(&mut self) -> bool {
+        if self.prefix_overflow.take().is_none() {
+            return false;
+        }
+        if self.state == State::Idle {
+            timer::update_timers(self);
+        }
+        true
+    }
+
+    /// Ready the peer for the `Event::Stop` of a hard `clear bgp`: the
+    /// reset is named, and a peer kept down for going over a limit may
+    /// connect again (FRR `peer_clear`).
+    pub fn clear_hard(&mut self) {
+        self.down_reason = Some(PeerDownReason::AdminReset);
+        self.release_prefix_overflow();
     }
 
     pub fn count_clear(&mut self) {
@@ -2236,6 +2396,10 @@ fn resolve_conn(peer: &Peer, id: ConnId) -> Option<ConnTag> {
 }
 
 pub fn fsm_next_state(peer: &mut Peer, event: Event) -> (State, FsmEffect) {
+    // FRR `bgp_start`: a peer kept down by `maximum-prefix` does not dial.
+    if peer.prefix_overflow.is_some() && event.starts_connection() {
+        return (peer.state, FsmEffect::None);
+    }
     match event {
         Event::ConfigUpdate => (peer.state, FsmEffect::None),
         Event::Start => match peer.state {
@@ -2348,28 +2512,54 @@ pub fn fsm_next_state(peer: &mut Peer, event: Event) -> (State, FsmEffect) {
         Event::AdvTimerVpnv4Expires => (fsm_adv_timer_vpnv4_expires(peer), FsmEffect::None),
         Event::AdvTimerVpnv6Expires => (fsm_adv_timer_vpnv6_expires(peer), FsmEffect::None),
         Event::AdvTimerEvpnExpires => (fsm_adv_timer_evpn_expires(peer), FsmEffect::None),
+        Event::PrefixLimitExceeded(exceeded) => {
+            (fsm_prefix_limit_exceeded(peer, exceeded), FsmEffect::None)
+        }
+        Event::PrefixLimitRestart => (fsm_prefix_limit_restart(peer), FsmEffect::None),
     }
 }
 
+/// Run the side effect of an event. Returns the event the effect leads
+/// to, which the FSM handles next.
 fn fsm_effect(
     id: usize,
     effect: FsmEffect,
     bgp: &mut BgpTop,
     peers: &mut PeerMap,
     shards: Option<&super::shard::pool::ShardPool>,
-) {
+) -> Option<Event> {
     match effect {
-        FsmEffect::None => {}
+        FsmEffect::None => None,
         FsmEffect::RouteUpdate(packet) => {
+            let families = announced_families(&packet);
             route_from_peer(id, packet, bgp, peers, shards);
+            peers
+                .get_mut_by_idx(id)?
+                .prefix_limit_check(bgp.shard, &families)
+                .map(Event::PrefixLimitExceeded)
         }
         FsmEffect::StaleExpire(afi_safi) => {
             stale_route_withdraw(id, afi_safi, bgp, peers);
+            None
         }
         FsmEffect::RouteRefreshRecv { afi: _, safi: _ } => {
             super::route::route_soft_out_peer(id, bgp, peers);
+            None
         }
     }
+}
+
+/// The families an UPDATE announces routes in: the ones whose
+/// `maximum-prefix` counts it can raise.
+fn announced_families(packet: &UpdatePacket) -> Vec<AfiSafi> {
+    let mut families = Vec::new();
+    if !packet.ipv4_update.is_empty() {
+        families.push(AfiSafi::new(Afi::Ip, Safi::Unicast));
+    }
+    if let Some(mp) = &packet.mp_update {
+        families.push(mp.afi_safi());
+    }
+    families
 }
 
 pub fn fsm(
@@ -2379,6 +2569,20 @@ pub fn fsm(
     event: Event,
     shards: Option<&super::shard::pool::ShardPool>,
 ) {
+    let mut next = Some(event);
+    while let Some(event) = next {
+        next = fsm_step(bgp_ref, peer_map, id, event, shards);
+    }
+}
+
+/// One event through the FSM. Returns the event it leads to.
+fn fsm_step(
+    bgp_ref: &mut BgpTop,
+    peer_map: &mut PeerMap,
+    id: usize,
+    event: Event,
+    shards: Option<&super::shard::pool::ShardPool>,
+) -> Option<Event> {
     // Captured before `event` is consumed: the down-cause this event
     // implies, in case it ends the established session below.
     let event_reason = PeerDownReason::from_event(&event);
@@ -2396,7 +2600,7 @@ pub fn fsm(
         // the later lookups in this function.)
         let Some(peer) = peer_map.get_mut_by_idx(id) else {
             tracing::debug!(ident = id, "bgp: dropping FSM event for a removed peer");
-            return;
+            return None;
         };
         let prev_state = peer.state;
         let (new_state, effect) = fsm_next_state(peer, event);
@@ -2419,17 +2623,28 @@ pub fn fsm(
             peer_map.membership_withdraw(id);
         } else if !prev_state.is_established() && now_established {
             peer_map.membership_enroll(id);
+            // Before the effect: an UPDATE can arrive in the event that
+            // completes the handshake, and its routes must be counted.
+            if let (Some(pool), Some(peer)) = (shards, peer_map.get_mut_by_idx(id)) {
+                let gauge = Arc::new(PoolPrefixGauge::new(pool.n()));
+                gauge.set_gate(
+                    peer.prefix_limit_of(AfiSafi::new(Afi::Ip, Safi::Unicast))
+                        .as_ref(),
+                );
+                pool.set_prefix_gauge(id, Some(gauge.clone()));
+                peer.prefix_gauge = Some(gauge);
+            }
         }
     }
 
     // Execute side effects that need peer_map.
-    fsm_effect(id, effect, bgp_ref, peer_map, shards);
+    let follow_up = fsm_effect(id, effect, bgp_ref, peer_map, shards);
 
     // Handle state-transition consequences.
     {
         let peer = peer_map.get_mut_by_idx(id).unwrap();
         if prev_state == peer.state {
-            return;
+            return follow_up;
         }
         if prev_state.is_established() && !peer.state.is_established() {
             peer.instant = Some(Instant::now());
@@ -2442,6 +2657,7 @@ pub fn fsm(
                     .unwrap_or(PeerDownReason::Unknown),
                 Instant::now(),
             ));
+            peer.prefix_limit.clear();
         }
         if !prev_state.is_established() && peer.state.is_established() {
             peer.instant = Some(Instant::now());
@@ -2475,6 +2691,9 @@ pub fn fsm(
             // A2 ⑥: drop the per-peer egress task (abort-on-drop) so it
             // doesn't outlive the session.
             peer.pet = None;
+            if let (Some(pool), Some(_)) = (shards, peer.prefix_gauge.take()) {
+                pool.set_prefix_gauge(id, None);
+            }
         }
     }
 
@@ -2507,6 +2726,7 @@ pub fn fsm(
         }
         peer_map.debug_verify_membership();
     }
+    follow_up
 }
 
 // The three advertise-debounce expiries below return `peer.state`, not
@@ -2982,6 +3202,7 @@ pub fn fsm_bgp_notification(peer: &mut Peer, conn: ConnTag, packet: Notification
         packet
             .shutdown_communication()
             .map(|m| format!(" — \"{m}\""))
+            .or_else(|| packet.max_prefix_data().map(|data| format!(" — {data}")))
             .unwrap_or_default(),
     );
     // `local-as … dual-as` (RFC 7705 migration aid): a Bad Peer AS
@@ -3247,6 +3468,56 @@ pub fn fsm_opensent_holdtimer_expires(peer: &mut Peer, conn: ConnTag) -> State {
 pub fn fsm_update_error(peer: &mut Peer, code: NotifyCode, sub_code: u8, data: Vec<u8>) -> State {
     peer_send_notification(peer, code, sub_code, data);
     State::Idle
+}
+
+/// Close a session that went over a `maximum-prefix` limit and keep the
+/// peer down (FRR `bgp_maximum_prefix_overflow`).
+pub fn fsm_prefix_limit_exceeded(peer: &mut Peer, exceeded: PrefixLimitExceeded) -> State {
+    if !peer.state.is_established() {
+        return peer.state;
+    }
+    let PrefixLimitExceeded {
+        afi_safi,
+        count,
+        max,
+        restart,
+    } = exceeded;
+    tracing::warn!(
+        peer = %peer.display_name(),
+        afi = %afi_safi.afi,
+        safi = %afi_safi.safi,
+        count,
+        max,
+        restart_secs = restart.map(|restart| restart.as_secs()),
+        "bgp: maximum-prefix exceeded; sending Cease and keeping the peer down",
+    );
+    let data = MaxPrefixData {
+        afi: afi_safi.afi,
+        safi: afi_safi.safi,
+        limit: max,
+    };
+    peer_send_notification_packet(peer, NotificationPacket::max_prefix_reached(data));
+    if let Some(gauge) = &peer.prefix_gauge {
+        gauge.close();
+    }
+    peer.prefix_overflow = Some(PrefixOverflow {
+        afi_safi,
+        since: Instant::now(),
+        restart: restart.map(|restart| timer::start_prefix_limit_restart_timer(peer, restart)),
+    });
+    State::Idle
+}
+
+/// The `maximum-prefix restart` time has passed: the peer may connect
+/// again.
+pub fn fsm_prefix_limit_restart(peer: &mut Peer) -> State {
+    if peer.release_prefix_overflow() {
+        tracing::info!(
+            peer = %peer.display_name(),
+            "bgp: maximum-prefix restart time passed; the peer may connect again",
+        );
+    }
+    peer.state
 }
 
 pub fn fsm_idle_hold_timer_expires(peer: &mut Peer) -> State {
@@ -3955,10 +4226,15 @@ fn build_open_packet(peer: &mut Peer) -> BytesMut {
 }
 
 pub fn peer_send_notification(peer: &mut Peer, code: NotifyCode, sub_code: u8, data: Vec<u8>) {
+    peer_send_notification_packet(peer, NotificationPacket::new(code, sub_code, data));
+}
+
+pub fn peer_send_notification_packet(peer: &mut Peer, notification: NotificationPacket) {
     let Some(packet_tx) = peer.packet_tx.as_ref() else {
         return;
     };
-    let notification = NotificationPacket::new(code, sub_code, data);
+    let code = notification.code;
+    let sub_code = notification.sub_code;
     let mut bytes: BytesMut = notification.into();
     // RFC 8654: NOTIFICATION to non-extended peer MUST NOT exceed 4096.
     if !peer.opt.extended_message && bytes.len() > BGP_PACKET_LEN {
@@ -4378,6 +4654,13 @@ pub fn apply_soft_in_peer(bgp: &mut Bgp, peer_idx: usize) {
             &mut bgp.peers,
             bgp.shards.as_ref(),
         );
+        // A new inbound policy can accept more of the stored routes.
+        let families: Vec<AfiSafi> = bgp
+            .peers
+            .get_by_idx(peer_idx)
+            .map(|peer| peer.prefix_limits().into_keys().collect())
+            .unwrap_or_default();
+        bgp.check_prefix_limits(peer_idx, &families);
     } else if supports_refresh {
         let peer = bgp.peers.get_mut_by_idx(peer_idx).expect("peer exists");
         for (afi, safi) in &mp_pairs {
@@ -4508,7 +4791,7 @@ pub fn clear_bgp_action(
         match op {
             BgpClearOp::Hard => {
                 if let Some(peer) = bgp.peers.get_mut_by_idx(peer_idx) {
-                    peer.down_reason = Some(PeerDownReason::AdminReset);
+                    peer.clear_hard();
                 }
                 let _ = bgp.tx.try_send(Message::Event(peer_idx, Event::Stop));
             }

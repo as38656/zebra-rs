@@ -284,6 +284,70 @@ module zebra-bgp-afi-knobs {
       }
     }
 
+    container maximum-prefix {
+      ext:sort "80";
+      ext:help "Limit the prefixes received from this neighbor";
+      description
+        "Limit how many prefixes of this family the neighbor may send
+         (FRR `neighbor X maximum-prefix`). When the count goes above
+         `max`, the session is closed with a Cease NOTIFICATION,
+         subcode Maximum Number of Prefixes Reached (RFC 4486), and
+         the neighbor stays down until `clear bgp`, or until `restart`
+         minutes have passed. With `warning-only` a warning is logged
+         and the session stays up.
+
+         Only ipv4, ipv6, label-v4, label-v6, vpnv4 and vpnv6 are
+         counted; a limit on another family is refused at commit.
+
+         A change applies at once: a limit below the current count
+         closes the session. Deleting the limit does not bring back a
+         neighbor that is down; `clear bgp` does.";
+      leaf max {
+        ext:help "Maximum number of prefixes";
+        type uint32 {
+          range "1..max";
+        }
+        mandatory true;
+      }
+      leaf threshold {
+        ext:help "Warning threshold in percent of max";
+        type uint8 {
+          range "1..100";
+        }
+        units "percent";
+        default "75";
+        description
+          "Log a warning when the count goes above this share of
+           `max`.";
+      }
+      leaf warning-only {
+        ext:help "Only log a warning when max is exceeded";
+        type boolean;
+        default "false";
+        description
+          "Keep the session when the count goes above `max` and log a
+           warning. Cannot be used with a non-zero `restart`.";
+      }
+      leaf restart {
+        ext:help "Minutes before the session may start again";
+        type uint16;
+        units "minutes";
+        description
+          "Start the session again this many minutes after it was
+           closed for the limit. Absent or 0: stay down until
+           `clear bgp`.";
+      }
+      leaf force {
+        ext:help "Count every received prefix, not only accepted ones";
+        type boolean;
+        default "false";
+        description
+          "Count every prefix received, before the inbound policy. By
+           default only the prefixes that pass the inbound policy and
+           the RFC 8212 check are counted.";
+      }
+    }
+
     container long-lived-graceful-restart {
       ext:help "Per-family long-lived GR settings (RFC 9494)";
       description

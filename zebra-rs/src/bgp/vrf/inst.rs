@@ -1783,10 +1783,63 @@ impl BgpVrf {
                 // No shard pool: `None` drives the synchronous replay
                 // that reads the retained per-VRF Adj-RIB-In.
                 super::super::route::route_soft_in_peer(peer_idx, &mut top, &mut self.peers, None);
+                let families: Vec<bgp_packet::AfiSafi> = self
+                    .peers
+                    .get_by_idx(peer_idx)
+                    .map(|peer| peer.prefix_limits().into_keys().collect())
+                    .unwrap_or_default();
+                self.check_prefix_limits(peer_idx, &families);
             }
             InOut::Output => {
                 super::super::route::route_soft_out_peer(peer_idx, &mut top, &mut self.peers);
             }
+        }
+    }
+
+    /// `clear bgp vrf <name> <target> [soft [in|out]]`: the global
+    /// `clear bgp` for this VRF's CE peers. `target` is an address or
+    /// `all`.
+    fn clear_peers(&mut self, target: &str, op: super::super::peer::BgpClearOp) {
+        use super::super::peer::{BgpClearOp, Event};
+        use super::super::policy::InOut;
+        let targets: Vec<usize> = if target == "all" {
+            self.peers.iter_all().map(|(_, peer)| peer.ident).collect()
+        } else {
+            target
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .and_then(|addr| self.peers.get(&addr))
+                .map(|peer| peer.ident)
+                .into_iter()
+                .collect()
+        };
+        for ident in targets {
+            match op {
+                BgpClearOp::Hard => {
+                    if let Some(peer) = self.peers.get_mut_by_idx(ident) {
+                        peer.clear_hard();
+                    }
+                    let _ = self.tx.try_send(Message::Event(ident, Event::Stop));
+                }
+                BgpClearOp::SoftBoth => {
+                    self.soft_reapply_peer(ident, InOut::Input);
+                    self.soft_reapply_peer(ident, InOut::Output);
+                }
+                BgpClearOp::SoftIn => self.soft_reapply_peer(ident, InOut::Input),
+                BgpClearOp::SoftOut => self.soft_reapply_peer(ident, InOut::Output),
+            }
+        }
+    }
+
+    /// Check `families` of CE peer `ident` against their `maximum-prefix`
+    /// limits now, and close the session when one is over.
+    fn check_prefix_limits(&mut self, ident: usize, families: &[bgp_packet::AfiSafi]) {
+        use super::super::peer::Event;
+        let Some(peer) = self.peers.get_mut_by_idx(ident) else {
+            return;
+        };
+        if let Some(exceeded) = peer.prefix_limit_check(&self.shard, families) {
+            self.process_msg(Message::Event(ident, Event::PrefixLimitExceeded(exceeded)));
         }
     }
 
@@ -3733,6 +3786,7 @@ impl BgpVrf {
         let before_mp: std::collections::BTreeSet<bgp_packet::AfiSafi> =
             peer.config.mp.0.keys().copied().collect();
         let before_filters = peer.attr_filter_config();
+        let before_limits = peer.prefix_limits();
         peer.remote_as = remote_as;
         peer.peer_type = if remote_as == self.asn {
             PeerType::IBGP
@@ -3751,6 +3805,18 @@ impl BgpVrf {
         // Unlike next-hop-self, these knobs change what was already sent,
         // so the peer is re-synced instead of waiting for the next route.
         let resync_out = !bounce && peer.attr_filter_config() != before_filters;
+        let after_limits = peer.prefix_limits();
+        let mut changed_limits: Vec<bgp_packet::AfiSafi> = before_limits
+            .keys()
+            .chain(after_limits.keys())
+            .filter(|afi_safi| before_limits.get(afi_safi) != after_limits.get(afi_safi))
+            .copied()
+            .collect();
+        changed_limits.sort();
+        changed_limits.dedup();
+        for afi_safi in &changed_limits {
+            peer.prefix_limit_changed(*afi_safi);
+        }
         // The TCP-AO key-chain binding after the config swap (set by
         // `apply_resolved_session_knobs`'s `apply_ao_config`).
         let new_ao_chain = peer
@@ -3807,6 +3873,9 @@ impl BgpVrf {
         // (a no-op when unchanged). Covers a runtime `bfd enabled` toggle or an
         // echo-param edit on a live CE session.
         self.bfd_reconcile(ident);
+        if !bounce {
+            self.check_prefix_limits(ident, &changed_limits);
+        }
         bgp_vrf_trace!(
             &self.tracing,
             vrf = %self.name,
@@ -3935,6 +4004,7 @@ impl BgpVrf {
                 self.tracing = tracing;
             }
             BgpVrfMsg::EbgpRequiresPolicy(value) => self.set_ebgp_requires_policy(value),
+            BgpVrfMsg::Clear { target, op } => self.clear_peers(&target, op),
             BgpVrfMsg::MupSegmentCatalog(catalog) => {
                 // The interwork/direct segment associations moved (or this
                 // is the post-spawn seed). Re-derive the GTP datapath —
@@ -7061,3 +7131,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "prefix_limit_tests.rs"]
+mod prefix_limit_tests;

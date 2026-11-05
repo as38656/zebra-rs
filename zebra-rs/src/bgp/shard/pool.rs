@@ -20,12 +20,16 @@
 //! This module is the parallel-execution machinery; wiring the ingest
 //! and the event-loop result handler through it lands in later slices.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
+use bgp_packet::{Afi, AfiSafi, Safi};
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::prefix_gauge::PoolPrefixGauge;
 use super::{BgpShard, ShardMsg, ShardOut};
 
 /// A shard worker's output for one processed message: the shard index
@@ -36,7 +40,23 @@ pub struct ShardResult {
     /// currently processes the deltas without needing the source index.
     #[allow(dead_code)]
     pub shard: usize,
+    /// The peer whose IPv4 unicast routes the message changed
+    /// ([`ShardMsg::v4_peer`]), for main's `maximum-prefix` check.
+    pub peer: Option<usize>,
     pub out: Vec<ShardOut>,
+}
+
+/// What a worker's inbox carries: work for its shard, or worker state
+/// that is not the shard's.
+#[derive(Debug)]
+enum WorkerMsg {
+    Shard(ShardMsg),
+    /// Start (`Some`) or stop (`None`) keeping a session's
+    /// [`PoolPrefixGauge`].
+    PrefixGauge {
+        ident: usize,
+        gauge: Option<Arc<PoolPrefixGauge>>,
+    },
 }
 
 /// One shard worker: owns a [`BgpShard`], consumes [`ShardMsg`]s from its
@@ -44,8 +64,9 @@ pub struct ShardResult {
 struct ShardWorker {
     idx: usize,
     shard: BgpShard,
-    inbox: Receiver<ShardMsg>,
+    inbox: Receiver<WorkerMsg>,
     results: UnboundedSender<ShardResult>,
+    prefix_gauges: BTreeMap<usize, Arc<PoolPrefixGauge>>,
 }
 
 impl ShardWorker {
@@ -53,16 +74,35 @@ impl ShardWorker {
         // Blocking recv on a dedicated thread; the loop ends when every
         // inbox sender is dropped (pool teardown) or on explicit Shutdown.
         while let Ok(msg) = self.inbox.recv() {
-            if matches!(msg, ShardMsg::Shutdown) {
-                break;
+            let msg = match msg {
+                WorkerMsg::Shard(ShardMsg::Shutdown) => break,
+                WorkerMsg::Shard(msg) => msg,
+                WorkerMsg::PrefixGauge { ident, gauge } => {
+                    match gauge {
+                        Some(gauge) => self.prefix_gauges.insert(ident, gauge),
+                        None => self.prefix_gauges.remove(&ident),
+                    };
+                    continue;
+                }
+            };
+            let peer = msg.v4_peer();
+            let gauge = peer.and_then(|ident| self.prefix_gauges.get(&ident).cloned());
+            let out = if msg.announces_v4() && gauge.as_ref().is_some_and(|g| g.is_closed()) {
+                Vec::new()
+            } else {
+                self.shard.handle(msg)
+            };
+            if let (Some(ident), Some(gauge)) = (peer, gauge) {
+                let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+                gauge.publish(self.idx, self.shard.prefix_counts(ident, v4));
             }
-            let out = self.shard.handle(msg);
             // Reply to every message (even empty) so main can account
             // per-message; if main is gone, wind the thread down.
             if self
                 .results
                 .send(ShardResult {
                     shard: self.idx,
+                    peer,
                     out,
                 })
                 .is_err()
@@ -79,7 +119,7 @@ impl ShardWorker {
 /// loop `select!`s on.
 pub struct ShardPool {
     n: usize,
-    inboxes: Vec<Sender<ShardMsg>>,
+    inboxes: Vec<Sender<WorkerMsg>>,
     /// Joined only by `shutdown`, which the daemon doesn't call (it runs
     /// the pool for its whole lifetime). Held so the handles aren't
     /// dropped, and ready for a graceful-teardown path.
@@ -104,6 +144,7 @@ impl ShardPool {
                 shard,
                 inbox: rx,
                 results: results.clone(),
+                prefix_gauges: BTreeMap::new(),
             };
             let handle = std::thread::Builder::new()
                 .name(format!("bgp-shard-{idx}"))
@@ -132,7 +173,7 @@ impl ShardPool {
     /// Send a message to one shard (by index). Unbounded — `send` only
     /// fails if the worker thread has died, which is a teardown race.
     pub fn dispatch(&self, idx: usize, msg: ShardMsg) {
-        let _ = self.inboxes[idx].send(msg);
+        let _ = self.inboxes[idx].send(WorkerMsg::Shard(msg));
     }
 
     /// Send a freshly-built message to **every** shard. Used for control
@@ -142,7 +183,19 @@ impl ShardPool {
     /// payload (e.g. an `Arc` clone) stays cheap.
     pub fn broadcast(&self, mut make: impl FnMut() -> ShardMsg) {
         for tx in &self.inboxes {
-            let _ = tx.send(make());
+            let _ = tx.send(WorkerMsg::Shard(make()));
+        }
+    }
+
+    /// Have every worker publish peer `ident`'s IPv4 unicast counts into
+    /// `gauge` from now on, or stop with `None`. Ordered with the
+    /// dispatched messages, so a session's gauge sees exactly its own.
+    pub fn set_prefix_gauge(&self, ident: usize, gauge: Option<Arc<PoolPrefixGauge>>) {
+        for tx in &self.inboxes {
+            let _ = tx.send(WorkerMsg::PrefixGauge {
+                ident,
+                gauge: gauge.clone(),
+            });
         }
     }
 
@@ -152,7 +205,7 @@ impl ShardPool {
     #[allow(dead_code)]
     pub fn shutdown(self) {
         for tx in &self.inboxes {
-            let _ = tx.send(ShardMsg::Shutdown);
+            let _ = tx.send(WorkerMsg::Shard(ShardMsg::Shutdown));
         }
         drop(self.inboxes);
         for handle in self.handles {
@@ -207,7 +260,103 @@ mod tests {
         pool.dispatch(idx, ShardMsg::PeerDown { ident: 7 });
         let res = rx.recv().await.expect("worker reply");
         assert_eq!(res.shard, 0);
+        assert_eq!(res.peer, Some(7));
         assert!(res.out.is_empty());
+        pool.shutdown();
+    }
+
+    fn batch(ident: usize, prefixes: &[&str]) -> ShardMsg {
+        use crate::bgp::route::BgpRibType;
+        use bgp_packet::{BgpAttr, BgpNexthop, Ipv4Nlri};
+        ShardMsg::RouteBatchV4(super::super::msg::ShardRouteBatchV4 {
+            ident,
+            peer_router_id: std::net::Ipv4Addr::new(10, 0, 0, 2),
+            typ: BgpRibType::EBGP,
+            from_client: false,
+            attr: Arc::new(BgpAttr {
+                nexthop: Some(BgpNexthop::Ipv4("10.0.0.2".parse().unwrap())),
+                ..Default::default()
+            }),
+            nlris: prefixes
+                .iter()
+                .map(|p| Ipv4Nlri {
+                    id: 0,
+                    prefix: p.parse().unwrap(),
+                })
+                .collect(),
+            enhe_egress: None,
+            stale: false,
+            nexthop_reachable: true,
+            compute_policy: true,
+            unbound_policy: crate::bgp::policy::UnboundPolicy::Permit,
+        })
+    }
+
+    /// A worker publishes the peer's counts after each of its messages,
+    /// closes the gauge when it takes them over the gate, and from then
+    /// on drops the peer's new routes while it still takes withdrawals.
+    #[tokio::test]
+    async fn a_worker_keeps_the_gauge_and_stops_at_the_gate() {
+        use super::super::prefix_gauge::GateTrip;
+        use crate::bgp::prefix_limit::{OverLimit, PrefixCounting, PrefixCounts, PrefixLimit};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = ShardPool::spawn(vec![BgpShard::default()], tx);
+        let gauge = Arc::new(PoolPrefixGauge::new(1));
+        gauge.set_gate(Some(&PrefixLimit {
+            max: 2,
+            threshold: 75,
+            counting: PrefixCounting::Accepted,
+            over_limit: OverLimit::Teardown { restart: None },
+        }));
+        pool.set_prefix_gauge(7, Some(gauge.clone()));
+
+        pool.dispatch(0, batch(7, &["10.0.0.0/24", "10.0.1.0/24"]));
+        let res = rx.recv().await.expect("worker reply");
+        assert_eq!(res.peer, Some(7));
+        assert_eq!(res.out.len(), 2);
+        let two = PrefixCounts {
+            received: 2,
+            accepted: 2,
+        };
+        assert_eq!(gauge.counts(), two);
+        assert!(!gauge.is_closed());
+
+        pool.dispatch(0, batch(7, &["10.0.2.0/24"]));
+        rx.recv().await.expect("worker reply");
+        assert_eq!(gauge.tripped(), Some(GateTrip { count: 3, max: 2 }));
+
+        pool.dispatch(0, batch(7, &["10.0.3.0/24", "10.0.4.0/24"]));
+        let res = rx.recv().await.expect("worker reply");
+        assert!(res.out.is_empty(), "dropped unread");
+        assert_eq!(gauge.counts().received, 3);
+
+        pool.dispatch(
+            0,
+            ShardMsg::WithdrawV4 {
+                ident: 7,
+                rd: None,
+                nlri: bgp_packet::Ipv4Nlri {
+                    id: 0,
+                    prefix: "10.0.0.0/24".parse().unwrap(),
+                },
+                rib_in: true,
+            },
+        );
+        rx.recv().await.expect("worker reply");
+        assert_eq!(gauge.counts(), two, "a withdrawal still goes through");
+
+        // Another peer's routes are not gated, and nothing is published
+        // for a peer without a gauge.
+        pool.dispatch(0, batch(8, &["10.1.0.0/24", "10.1.1.0/24", "10.1.2.0/24"]));
+        let res = rx.recv().await.expect("worker reply");
+        assert_eq!(res.out.len(), 3);
+        assert_eq!(gauge.counts(), two);
+
+        pool.set_prefix_gauge(7, None);
+        pool.dispatch(0, ShardMsg::PeerDown { ident: 7 });
+        rx.recv().await.expect("worker reply");
+        assert_eq!(gauge.counts(), two, "the session's gauge is let go");
         pool.shutdown();
     }
 }

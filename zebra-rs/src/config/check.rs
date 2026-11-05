@@ -8,7 +8,12 @@
 //! dispatched: a step (YANG has none), or a decimal64 range or
 //! `fraction-digits` (libyang extracts neither).
 
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+
+use super::Args;
 use crate::bgp::ethernet_segment::check_es_esi;
+use crate::bgp::prefix_limit::counted_family;
 use crate::flex_algo::check_max_link_loss;
 use crate::stamp::session::{check_loss_interval, check_loss_percent};
 
@@ -54,6 +59,106 @@ pub fn etree_backend(leaves: &[(String, Vec<String>)]) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Whether a config line can carry a leaf [`prefix_limit`] reads, so the
+/// caller parses only those.
+pub fn prefix_limit_line(line: &str) -> bool {
+    line.contains(" maximum-prefix ")
+}
+
+/// The `maximum-prefix` statements among a whole config's
+/// [`prefix_limit_line`]s, as (callback path, arguments), that cannot be
+/// applied: a limit on a family whose prefixes are not counted, and
+/// `warning-only true` with a non-zero `restart`, which ask for opposite
+/// things. One error per neighbor family and problem.
+pub fn prefix_limit(leaves: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut families = BTreeMap::<PrefixLimitOwner, PrefixLimitLeaves>::new();
+    for (path, args) in leaves {
+        let Some((owner, leaf, value)) = PrefixLimitOwner::of(path, args) else {
+            continue;
+        };
+        let family = families.entry(owner).or_default();
+        match leaf {
+            "warning-only" => family.warning_only = value == "true",
+            "restart" => family.restart = value != "0",
+            _ => {}
+        }
+    }
+    let mut errors = Vec::new();
+    for (owner, family) in families {
+        let counted = Args(VecDeque::from([owner.afi_safi.clone()]))
+            .afi_safi()
+            .is_some_and(counted_family);
+        if !counted {
+            errors.push(format!(
+                "{owner}: {} prefixes are not counted; use ipv4, ipv6, \
+                 label-v4, label-v6, vpnv4 or vpnv6",
+                owner.afi_safi
+            ));
+        }
+        if family.warning_only && family.restart {
+            errors.push(format!(
+                "{owner}: warning-only and restart cannot be used together"
+            ));
+        }
+    }
+    errors
+}
+
+const NEIGHBOR_PREFIX_LIMIT_PATH: &str = "/router/bgp/neighbor/afi-safi/maximum-prefix/";
+const VRF_NEIGHBOR_PREFIX_LIMIT_PATH: &str = "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/";
+
+/// One `afi-safi <name> maximum-prefix` container: of a global neighbor
+/// when `vrf` is `None`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PrefixLimitOwner {
+    vrf: Option<String>,
+    neighbor: String,
+    afi_safi: String,
+}
+
+impl PrefixLimitOwner {
+    /// The owner, leaf name and value of a `maximum-prefix` leaf.
+    fn of<'a>(path: &'a str, args: &'a [String]) -> Option<(Self, &'a str, &'a str)> {
+        let (vrf, leaf, args) = if let Some(leaf) = path.strip_prefix(NEIGHBOR_PREFIX_LIMIT_PATH) {
+            (None, leaf, args)
+        } else {
+            let leaf = path.strip_prefix(VRF_NEIGHBOR_PREFIX_LIMIT_PATH)?;
+            let (vrf, args) = args.split_first()?;
+            (Some(vrf.clone()), leaf, args)
+        };
+        let [neighbor, afi_safi, value] = args else {
+            return None;
+        };
+        let owner = Self {
+            vrf,
+            neighbor: neighbor.clone(),
+            afi_safi: afi_safi.clone(),
+        };
+        Some((owner, leaf, value.as_str()))
+    }
+}
+
+impl fmt::Display for PrefixLimitOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "router bgp")?;
+        if let Some(vrf) = &self.vrf {
+            write!(f, " vrf {vrf}")?;
+        }
+        write!(
+            f,
+            " neighbor {} afi-safi {} maximum-prefix",
+            self.neighbor, self.afi_safi
+        )
+    }
+}
+
+/// The leaves of one owner that can conflict.
+#[derive(Default)]
+struct PrefixLimitLeaves {
+    warning_only: bool,
+    restart: bool,
 }
 
 /// A leaf value check: `Err` holds the reason, shown after the line.
@@ -170,6 +275,118 @@ mod tests {
         assert!(etree_backend_line("system ebpf enabled true"));
         assert!(etree_backend_line("system cradle enabled true"));
         assert!(!etree_backend_line("system cradle grpc-endpoint unix:x"));
+    }
+
+    const NBR_LIMIT: &str = "/router/bgp/neighbor/afi-safi/maximum-prefix";
+    const VRF_LIMIT: &str = "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix";
+
+    /// `warning-only` keeps the session and `restart` restarts a session
+    /// that was closed, so one family of one neighbor cannot have both.
+    /// `restart 0` means no restart and goes with anything.
+    #[test]
+    fn prefix_limit_warning_only_excludes_restart() {
+        let global = [
+            leaf(&format!("{NBR_LIMIT}/max"), &["10.0.0.1", "ipv4", "10"]),
+            leaf(
+                &format!("{NBR_LIMIT}/warning-only"),
+                &["10.0.0.1", "ipv4", "true"],
+            ),
+            leaf(&format!("{NBR_LIMIT}/restart"), &["10.0.0.1", "ipv4", "5"]),
+        ];
+        assert_eq!(
+            prefix_limit(&global),
+            vec![
+                "router bgp neighbor 10.0.0.1 afi-safi ipv4 maximum-prefix: \
+                 warning-only and restart cannot be used together"
+                    .to_string()
+            ]
+        );
+        let vrf = [
+            leaf(
+                &format!("{VRF_LIMIT}/warning-only"),
+                &["red", "10.0.0.2", "ipv6", "true"],
+            ),
+            leaf(
+                &format!("{VRF_LIMIT}/restart"),
+                &["red", "10.0.0.2", "ipv6", "1"],
+            ),
+        ];
+        assert_eq!(
+            prefix_limit(&vrf),
+            vec![
+                "router bgp vrf red neighbor 10.0.0.2 afi-safi ipv6 maximum-prefix: \
+                 warning-only and restart cannot be used together"
+                    .to_string()
+            ]
+        );
+
+        // Different families, or neighbors, do not meet.
+        assert!(
+            prefix_limit(&[
+                leaf(
+                    &format!("{NBR_LIMIT}/warning-only"),
+                    &["10.0.0.1", "ipv4", "true"],
+                ),
+                leaf(&format!("{NBR_LIMIT}/restart"), &["10.0.0.1", "ipv6", "5"]),
+                leaf(&format!("{NBR_LIMIT}/restart"), &["10.0.0.3", "ipv4", "5"]),
+            ])
+            .is_empty()
+        );
+        // `restart 0` and `warning-only false` ask for nothing.
+        assert!(
+            prefix_limit(&[
+                leaf(
+                    &format!("{NBR_LIMIT}/warning-only"),
+                    &["10.0.0.1", "ipv4", "true"],
+                ),
+                leaf(&format!("{NBR_LIMIT}/restart"), &["10.0.0.1", "ipv4", "0"]),
+            ])
+            .is_empty()
+        );
+        assert!(
+            prefix_limit(&[
+                leaf(
+                    &format!("{NBR_LIMIT}/warning-only"),
+                    &["10.0.0.1", "ipv4", "false"],
+                ),
+                leaf(&format!("{NBR_LIMIT}/restart"), &["10.0.0.1", "ipv4", "5"]),
+            ])
+            .is_empty()
+        );
+    }
+
+    /// Only the families the shard tables hold are counted; a limit on
+    /// any other would silently do nothing.
+    #[test]
+    fn prefix_limit_needs_a_counted_family() {
+        for family in ["ipv4", "ipv6", "label-v4", "label-v6", "vpnv4", "vpnv6"] {
+            assert!(
+                prefix_limit(&[leaf(
+                    &format!("{NBR_LIMIT}/max"),
+                    &["10.0.0.1", family, "10"]
+                )])
+                .is_empty(),
+                "{family}"
+            );
+        }
+        assert_eq!(
+            prefix_limit(&[leaf(
+                &format!("{NBR_LIMIT}/max"),
+                &["10.0.0.1", "evpn", "10"]
+            )]),
+            vec![
+                "router bgp neighbor 10.0.0.1 afi-safi evpn maximum-prefix: \
+                 evpn prefixes are not counted; use ipv4, ipv6, label-v4, \
+                 label-v6, vpnv4 or vpnv6"
+                    .to_string()
+            ]
+        );
+        assert!(prefix_limit_line(
+            "router bgp neighbor 10.0.0.1 afi-safi ipv4 maximum-prefix max 10"
+        ));
+        assert!(!prefix_limit_line(
+            "router bgp neighbor 10.0.0.1 afi-safi ipv4 prefix-sid send true"
+        ));
     }
 
     /// An Ethernet Segment's ESI: well-formed and not reserved (RFC 7432

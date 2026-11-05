@@ -15,6 +15,7 @@ use super::peer::{
     AfiSafiEncapType, AllowAsIn, LocalAs, Peer, PeerCounter, PeerParam, RemovePrivateAs, State,
 };
 use super::peer_map::PeerMap;
+use super::prefix_limit::{OverLimit, PrefixCounting, PrefixLimit};
 use super::route::LocalRib;
 use super::vrf::inst::BgpVrf;
 use crate::bgp::{AdjRibEvpnTable, AdjRibTable, BgpRib, BgpRibType, RibDirection};
@@ -277,7 +278,7 @@ fn write_summary_peer_row(
     let up_down = uptime(&peer.instant);
     let negotiated = peer_has_negotiated(peer, afi, safi);
 
-    let state_str = peer.state.to_str().to_string();
+    let state_str = summary_state(peer);
     let pfx_str = if peer.state != State::Established {
         "N/A".to_string()
     } else if !negotiated {
@@ -317,6 +318,16 @@ fn write_summary_peer_row(
         pfx_str,
         hostname,
     )
+}
+
+/// The summary's State word: FRR's `Idle (PfxCt)` for a peer kept down
+/// for going over a `maximum-prefix` limit.
+fn summary_state(peer: &Peer) -> String {
+    if peer.prefix_overflow.is_some() {
+        "Idle (PfxCt)".to_string()
+    } else {
+        peer.state.to_str().to_string()
+    }
 }
 
 /// A prefix count of the summary, or FRR's `(Policy)` when RFC 8212 lets
@@ -2425,7 +2436,7 @@ fn summary_peer_row_json(
     // FRR-style State/PfxRcd column: an Established session shows its
     // received-prefix count in place of the state word.
     let state = if peer.state != State::Established {
-        peer.state.to_str().to_string()
+        summary_state(peer)
     } else {
         pfx_cell(pfx_rcvd, policy_missing.is_some_and(|m| m.inbound))
     };
@@ -4010,6 +4021,68 @@ struct Neighbor<'a> {
     /// UPDATEs whose BGP Prefix-SID was discarded on receipt (RFC 8669
     /// §4).
     prefix_sid_discarded: u64,
+    /// The `maximum-prefix` of each family that has one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prefix_limits: Vec<PrefixLimitView>,
+    /// Set while the peer is kept down for going over a limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_overflow: Option<PrefixOverflowView>,
+}
+
+/// `show bgp neighbor` view of one family's `maximum-prefix` and the
+/// counts it is checked against.
+#[derive(Debug, Serialize)]
+struct PrefixLimitView {
+    #[serde(skip)]
+    afi_safi: AfiSafi,
+    /// The family as the config names it (`ipv4`, `vpnv6`, …).
+    family: &'static str,
+    max: u32,
+    threshold: u8,
+    warning_only: bool,
+    force: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_minutes: Option<u64>,
+    received: u64,
+    accepted: u64,
+}
+
+impl PrefixLimitView {
+    fn of(
+        peer: &Peer,
+        shard: &super::shard::BgpShard,
+        afi_safi: AfiSafi,
+        limit: PrefixLimit,
+    ) -> Self {
+        let counts = peer.prefix_counts(shard, afi_safi);
+        let restart = match limit.over_limit {
+            OverLimit::Teardown { restart } => restart,
+            OverLimit::Warn => None,
+        };
+        Self {
+            afi_safi,
+            family: afi_safi_config_name(&afi_safi),
+            max: limit.max,
+            threshold: limit.threshold,
+            warning_only: limit.over_limit == OverLimit::Warn,
+            force: limit.counting == PrefixCounting::Received,
+            restart_minutes: restart.map(|restart| restart.as_secs() / 60),
+            received: counts.received,
+            accepted: counts.accepted,
+        }
+    }
+}
+
+/// `show bgp neighbor` view of [`Peer::prefix_overflow`].
+#[derive(Debug, Serialize)]
+struct PrefixOverflowView {
+    family: &'static str,
+    /// Time since the session closed, `peer_uptime` format.
+    since: String,
+    /// Seconds until the peer may connect again; `None` waits for
+    /// `clear bgp`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_in: Option<u64>,
 }
 
 /// The directions of one family with no policy under RFC 8212.
@@ -4235,7 +4308,7 @@ struct LastReset {
     reason: &'static str,
 }
 
-fn fetch(peer: &Peer) -> Neighbor<'_> {
+fn fetch<'a>(peer: &'a Peer, shard: &super::shard::BgpShard) -> Neighbor<'a> {
     // Get remaining time for keepalive and hold timers
     let keepalive_timer_rem = peer.timer.keepalive.as_ref().map(|t| t.rem_sec());
     let hold_timer_rem = peer.timer.hold_timer.as_ref().map(|t| t.rem_sec());
@@ -4344,6 +4417,19 @@ fn fetch(peer: &Peer) -> Neighbor<'_> {
         policy_bindings: collect_policy_bindings(peer),
         missing_policy: collect_missing_policy(peer),
         prefix_sid_discarded: peer.prefix_sid_discarded,
+        prefix_limits: peer
+            .prefix_limits()
+            .into_iter()
+            .map(|(afi_safi, limit)| PrefixLimitView::of(peer, shard, afi_safi, limit))
+            .collect(),
+        prefix_overflow: peer
+            .prefix_overflow
+            .as_ref()
+            .map(|overflow| PrefixOverflowView {
+                family: afi_safi_config_name(&overflow.afi_safi),
+                since: uptime(&Some(overflow.since)),
+                restart_in: overflow.restart.as_ref().map(|timer| timer.rem_sec()),
+            }),
     };
 
     // Timers.
@@ -4385,6 +4471,59 @@ fn format_nd_elapsed(secs: u64) -> String {
     } else {
         format!("{}s", s)
     }
+}
+
+/// The `maximum-prefix` lines of `show bgp neighbor`, worded as FRR's.
+fn render_prefix_limits(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
+    for limit in &neighbor.prefix_limits {
+        writeln!(
+            out,
+            "  For address family: {} {}",
+            limit.afi_safi.afi, limit.afi_safi.safi
+        )?;
+        writeln!(
+            out,
+            "    {} accepted prefixes, {} received",
+            limit.accepted, limit.received
+        )?;
+        let modes: Vec<&str> = [(limit.force, "force"), (limit.warning_only, "warning-only")]
+            .into_iter()
+            .filter_map(|(on, mode)| on.then_some(mode))
+            .collect();
+        write!(out, "    Maximum prefixes allowed {}", limit.max)?;
+        if !modes.is_empty() {
+            write!(out, " ({})", modes.join(", "))?;
+        }
+        writeln!(out)?;
+        write!(
+            out,
+            "    Threshold for warning message {}%",
+            limit.threshold
+        )?;
+        if let Some(minutes) = limit.restart_minutes {
+            write!(out, ", restart interval {minutes} min")?;
+        }
+        writeln!(out)?;
+    }
+    if let Some(overflow) = &neighbor.prefix_overflow {
+        writeln!(
+            out,
+            "  Peer had exceeded the max. no. of prefixes configured."
+        )?;
+        match overflow.restart_in {
+            Some(secs) => writeln!(
+                out,
+                "  Reduce the no. of prefix from {}, will restart in {} seconds",
+                neighbor.address, secs
+            )?,
+            None => writeln!(
+                out,
+                "  Reduce the no. of prefix and clear bgp {} to restore peering",
+                neighbor.address
+            )?,
+        }
+    }
+    Ok(())
 }
 
 fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
@@ -4705,6 +4844,7 @@ fn render(out: &mut String, neighbor: &Neighbor) -> std::fmt::Result {
             neighbor.prefix_sid_discarded
         )?;
     }
+    render_prefix_limits(out, neighbor)?;
 
     writeln!(out)?;
 
@@ -5118,7 +5258,7 @@ fn show_bgp_neighbor<V: BgpShowView>(
         // peers are listed too — they're invisible to the address-keyed
         // `iter`, and an operator has no remote address to query them by.
         for (_, peer) in bgp.peers().iter_all() {
-            neighbors.push(fetch(peer));
+            neighbors.push(fetch(peer, bgp.shard()));
         }
         if json {
             return Ok(serde_json::to_string_pretty(&neighbors)
@@ -5148,7 +5288,7 @@ fn show_bgp_neighbor<V: BgpShowView>(
                 .find(|peer| peer.ifname.as_deref() == Some(target.as_str())),
         };
         if let Some(peer) = peer {
-            let neighbor = fetch(peer);
+            let neighbor = fetch(peer, bgp.shard());
             if json {
                 return Ok(serde_json::to_string_pretty(&neighbor)
                     .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e)));
@@ -7158,6 +7298,126 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         }
     }
 
+    /// `maximum-prefix` in `show bgp neighbor`: the limit, mode and
+    /// counts of each family with one, and FRR's lines for a peer kept
+    /// down; the summary shows it as `Idle (PfxCt)`. Text and JSON.
+    #[test]
+    fn maximum_prefix_is_shown() {
+        use super::super::peer::PeerDownReason;
+        use super::super::prefix_limit::{PrefixLimitConfig, PrefixOverflow};
+
+        let v4 = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let v6 = AfiSafi::new(Afi::Ip6, Safi::Unicast);
+        let addr: IpAddr = Ipv4Addr::new(10, 0, 0, 9).into();
+        let mut peer = make_peer(addr);
+        peer.config.sub.entry(v4).or_default().prefix_limit = PrefixLimitConfig {
+            max: Some(10),
+            threshold: Some(90),
+            restart: Some(5),
+            force: true,
+            ..Default::default()
+        };
+        peer.config.sub.entry(v6).or_default().prefix_limit = PrefixLimitConfig {
+            max: Some(20),
+            warning_only: true,
+            ..Default::default()
+        };
+        let mut peers = PeerMap::new();
+        peers.insert(addr, peer);
+        let mut view = TestView {
+            rib: LocalRib::default(),
+            shard: super::super::shard::BgpShard::default(),
+            peers,
+        };
+        // Two prefixes received, one of them accepted.
+        let ident = view.peers.get(&addr).unwrap().ident;
+        let attr = BgpAttr {
+            nexthop: Some(BgpNexthop::Ipv4(Ipv4Addr::new(10, 0, 0, 9))),
+            ..Default::default()
+        };
+        let rib = BgpRib::new(
+            ident,
+            Ipv4Addr::new(10, 0, 0, 9),
+            BgpRibType::EBGP,
+            0,
+            0,
+            &attr,
+            None,
+            None,
+            false,
+        );
+        for prefix in ["10.1.0.0/24", "10.1.1.0/24"] {
+            let prefix: Ipv4Net = prefix.parse().unwrap();
+            view.shard.adj_in_mut(ident).add(None, prefix, rib.clone());
+        }
+        view.shard.v4.update("10.1.0.0/24".parse().unwrap(), rib);
+        let show = |view: &TestView, json: bool| {
+            let args = Args(VecDeque::from(["10.0.0.9".to_string()]));
+            show_bgp_neighbor(view, args, json).unwrap()
+        };
+
+        let out = show(&view, false);
+        for line in [
+            "  For address family: IPv4 Unicast",
+            "    1 accepted prefixes, 2 received",
+            "    Maximum prefixes allowed 10 (force)",
+            "    Threshold for warning message 90%, restart interval 5 min",
+            "  For address family: IPv6 Unicast",
+            "    0 accepted prefixes, 0 received",
+            "    Maximum prefixes allowed 20 (warning-only)",
+            "    Threshold for warning message 75%",
+        ] {
+            assert!(out.lines().any(|l| l == line), "missing `{line}`:\n{out}");
+        }
+        assert!(!out.contains("exceeded"), "{out}");
+
+        let peer = view.peers.get_mut(&addr).unwrap();
+        peer.prefix_overflow = Some(PrefixOverflow {
+            afi_safi: v4,
+            since: Instant::now(),
+            restart: None,
+        });
+        peer.last_reset = Some((PeerDownReason::PrefixLimit, Instant::now()));
+        let peer = view.peers.get(&addr).unwrap();
+        let mut row = String::new();
+        write_summary_peer_row(&mut row, &view.shard, peer, Afi::Ip, Safi::Unicast, None).unwrap();
+        assert!(row.contains(" Idle (PfxCt) "), "{row}");
+        let json_row = summary_peer_row_json(&view.shard, peer, Afi::Ip, Safi::Unicast, None);
+        assert_eq!(json_row.state, "Idle (PfxCt)");
+
+        let out = show(&view, false);
+        assert!(
+            out.contains(", due to Reached received prefix count\n"),
+            "{out}"
+        );
+        for line in [
+            "  Peer had exceeded the max. no. of prefixes configured.",
+            "  Reduce the no. of prefix and clear bgp 10.0.0.9 to restore peering",
+        ] {
+            assert!(out.lines().any(|l| l == line), "missing `{line}`:\n{out}");
+        }
+
+        let out = show(&view, true);
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["state"], "Idle");
+        assert_eq!(
+            json["last_reset"]["reason"],
+            "Reached received prefix count"
+        );
+        assert_eq!(json["prefix_overflow"]["family"], "ipv4");
+        assert!(json["prefix_overflow"].get("restart_in").is_none());
+        let v4_limit = &json["prefix_limits"][0];
+        assert_eq!(v4_limit["family"], "ipv4");
+        assert_eq!(v4_limit["max"], 10);
+        assert_eq!(v4_limit["threshold"], 90);
+        assert_eq!(v4_limit["force"], true);
+        assert_eq!(v4_limit["warning_only"], false);
+        assert_eq!(v4_limit["restart_minutes"], 5);
+        assert_eq!(v4_limit["received"], 2);
+        assert_eq!(v4_limit["accepted"], 1);
+        assert_eq!(json["prefix_limits"][1]["warning_only"], true);
+    }
+
     /// Interface-keyed (IPv6 unnumbered) peers were invisible to every
     /// summary: the renderers iterated the address-keyed `iter()`. They
     /// must be listed — identified by interface name, FRR-style — and
@@ -7379,8 +7639,9 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
         use super::super::timer::{OPENSENT_HOLD_TIME, start_opensent_hold_timer};
 
         let mut peer = make_peer(Ipv4Addr::new(10, 0, 0, 9).into());
+        let shard = super::super::shard::BgpShard::default();
         let mut out = String::new();
-        render(&mut out, &fetch(&peer)).unwrap();
+        render(&mut out, &fetch(&peer, &shard)).unwrap();
         assert!(
             !out.contains("OpenSent hold timer"),
             "no timer, no line:\n{out}"
@@ -7388,7 +7649,7 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
 
         peer.timer.opensent_hold_timer = Some(start_opensent_hold_timer(&peer, 1));
         let mut out = String::new();
-        render(&mut out, &fetch(&peer)).unwrap();
+        render(&mut out, &fetch(&peer, &shard)).unwrap();
         let rem: u64 = out
             .lines()
             .find_map(|line| line.strip_prefix("  Next OpenSent hold timer expires in "))
@@ -7637,6 +7898,8 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
             policy_bindings: Vec::new(),
             missing_policy: Vec::new(),
             prefix_sid_discarded: 0,
+            prefix_limits: Vec::new(),
+            prefix_overflow: None,
         }
     }
 }

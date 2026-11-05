@@ -228,6 +228,30 @@ pub enum ShardMsg {
     Shutdown,
 }
 
+impl ShardMsg {
+    /// The peer whose IPv4 unicast routes this message changes, if any.
+    pub fn v4_peer(&self) -> Option<usize> {
+        match self {
+            Self::UpdateV4(u) if u.rd.is_none() => Some(u.ident),
+            Self::RouteBatchV4(b) => Some(b.ident),
+            Self::WithdrawV4 {
+                ident, rd: None, ..
+            } => Some(*ident),
+            Self::PeerDown { ident } | Self::SoftInV4 { ident, .. } => Some(*ident),
+            _ => None,
+        }
+    }
+
+    /// Whether this message brings the peer new IPv4 unicast routes.
+    pub fn announces_v4(&self) -> bool {
+        match self {
+            Self::UpdateV4(u) => u.rd.is_none(),
+            Self::RouteBatchV4(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Per-dump egress params a [`ShardMsg::DumpV4`] carries — the peer-derived
 /// inputs a shard can't reconstruct without the `Peer`, resolved on main in
 /// `broadcast_dump_v4`: AddPath-send, the LLGR capability (for the

@@ -1,0 +1,19 @@
+# z1 (AS 65001) takes five routes from z2. The scenarios set the
+# maximum-prefix limit on this session at run time.
+interface:
+- if-name: z2
+  ipv4:
+    address: 192.168.0.1/24
+router:
+  bgp:
+    global:
+      as: 65001
+      router-id: 192.168.0.1
+    neighbor:
+    - remote-address: 192.168.0.2
+      remote-as: 65002
+      timers: {connect-retry-time: 3}
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true

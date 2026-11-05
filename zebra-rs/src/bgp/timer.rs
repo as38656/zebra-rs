@@ -265,6 +265,12 @@ pub fn start_stale_timer(peer: &Peer, afi_safi: AfiSafi, stale_time: u32) -> Tim
     })
 }
 
+/// Ends the hold of a peer that went over its `maximum-prefix` limit,
+/// `restart` after it went down.
+pub fn start_prefix_limit_restart_timer(peer: &Peer, restart: std::time::Duration) -> Timer {
+    start_timer!(peer, tx, restart.as_secs(), Event::PrefixLimitRestart)
+}
+
 pub fn refresh_hold_timer(peer: &mut Peer) {
     // A guard re-arm from `fsm_holdtimer_expires` runs shorter than
     // the negotiated hold time; refreshing it would keep expiring the
@@ -304,7 +310,11 @@ pub fn update_timers(peer: &mut Peer) {
     use State::*;
     match peer.state {
         Idle => {
-            if peer.is_passive() {
+            if peer.prefix_overflow.is_some() {
+                // Kept down by `maximum-prefix`: no redial, and no
+                // passive wait that would take a connection.
+                peer.timer.idle_hold_timer = None;
+            } else if peer.is_passive() {
                 // When the peer is configured as passive, its status will transition to
                 // Active. This is the only place we manipulate the peer status outside the
                 // FSM.

@@ -19,10 +19,11 @@ use std::sync::Arc;
 use bgp_packet::RouteDistinguisher;
 use ipnet::{Ipv4Net, Ipv6Net};
 
-use bgp_packet::{Afi, BgpAttr, Safi};
+use bgp_packet::{Afi, AfiSafi, BgpAttr, Safi};
 
 use super::adj_rib::ShardAdjIn;
 use super::label_chunks::LabelChunks;
+use super::prefix_limit::PrefixCounts;
 use super::route::{BgpRib, LocalRibTable};
 use super::store::BgpAttrStore;
 use crate::spf::label_block::LabelBlock;
@@ -32,6 +33,7 @@ pub use msg::{ShardMsg, ShardOut};
 
 pub mod dispatch;
 pub mod pool;
+pub mod prefix_gauge;
 
 /// A shard's local MPLS label allocator for the families that mint a
 /// per-route *local* label in the hot path: Labeled-Unicast (v4/v6,
@@ -300,6 +302,24 @@ impl BgpShard {
     /// Drop the peer's entire Adj-RIB-In slice (peer-down sweep).
     pub fn adj_in_drop(&mut self, ident: usize) {
         self.adj_in.remove(&ident);
+    }
+
+    /// The `maximum-prefix` counts of peer `ident` in `afi_safi` that this
+    /// shard holds; zero for a family it does not hold.
+    pub fn prefix_counts(&self, ident: usize, afi_safi: AfiSafi) -> PrefixCounts {
+        let accepted = match (afi_safi.afi, afi_safi.safi) {
+            (Afi::Ip, Safi::Unicast) => self.v4.3.get(ident),
+            (Afi::Ip6, Safi::Unicast) => self.v6.3.get(ident),
+            (Afi::Ip, Safi::MplsLabel) => self.v4lu.3.get(ident),
+            (Afi::Ip6, Safi::MplsLabel) => self.v6lu.3.get(ident),
+            (Afi::Ip, Safi::MplsVpn) => self.v4vpn.values().map(|t| t.3.get(ident)).sum(),
+            (Afi::Ip6, Safi::MplsVpn) => self.v6vpn.values().map(|t| t.3.get(ident)).sum(),
+            _ => 0,
+        };
+        PrefixCounts {
+            received: self.adj_in_count(ident, afi_safi.afi, afi_safi.safi) as u64,
+            accepted,
+        }
     }
 
     /// Received-prefix count for a sharded AFI/SAFI (0 for main-owned

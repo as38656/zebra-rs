@@ -2191,6 +2191,7 @@ pub struct LocalRibTable<P>(
     pub PrefixMap<P, Vec<BgpRib>>, // Cands.
     pub PrefixMap<P, BgpRib>,      // Selected.
     pub MultipathCfg,              // Per-family multipath policy.
+    pub PeerPrefixes,              // Prefixes with a candidate, per peer.
 );
 
 impl<P> Default for LocalRibTable<P> {
@@ -2199,8 +2200,42 @@ impl<P> Default for LocalRibTable<P> {
             PrefixMap::default(),
             PrefixMap::default(),
             MultipathCfg::default(),
+            PeerPrefixes::default(),
         )
     }
+}
+
+/// How many prefixes of one table each peer has a candidate for: the
+/// accepted count of `maximum-prefix`. The paths of one prefix from one
+/// peer (Add-Path) count once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PeerPrefixes(BTreeMap<usize, u64>);
+
+impl PeerPrefixes {
+    pub fn get(&self, ident: usize) -> u64 {
+        self.0.get(&ident).copied().unwrap_or(0)
+    }
+
+    /// Record a change at one prefix: whether peer `ident` had a
+    /// candidate there before it, and whether it has one after.
+    fn track(&mut self, ident: usize, had: bool, has: bool) {
+        match (had, has) {
+            (false, true) => *self.0.entry(ident).or_default() += 1,
+            (true, false) => {
+                if let Some(count) = self.0.get_mut(&ident) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.0.remove(&ident);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn has_candidate(cands: &[BgpRib], ident: usize) -> bool {
+    cands.iter().any(|r| r.ident == ident)
 }
 
 /// Instance-level MED knobs (zebra-bgp-bestpath.yang): `router bgp
@@ -2428,6 +2463,8 @@ impl<P: Prefix> std::fmt::Debug for LocalRibTable<P> {
 impl<P: Prefix + Copy> LocalRibTable<P> {
     pub fn update(&mut self, prefix: P, rib: BgpRib) -> (Vec<BgpRib>, Vec<BgpRib>, u32) {
         let cands = self.0.entry(prefix).or_default();
+        self.3
+            .track(rib.ident, has_candidate(cands, rib.ident), true);
 
         // Find if we're replacing an existing route (same peer ident and path ID)
         let existing_local_id = cands
@@ -2468,11 +2505,60 @@ impl<P: Prefix + Copy> LocalRibTable<P> {
 
     pub fn remove(&mut self, prefix: P, id: u32, ident: usize) -> Vec<BgpRib> {
         let cands = self.0.entry(prefix).or_default();
+        let had = has_candidate(cands, ident);
         let removed: Vec<BgpRib> = cands
             .extract_if(.., |r| r.ident == ident && r.remote_id == id)
             .collect();
         cands.shrink_to_fit();
+        self.3.track(ident, had, has_candidate(cands, ident));
         removed
+    }
+
+    /// Apply a change another table made at `prefix`, keeping this one its
+    /// read replica: drop the `replaced` candidates, put `added` in, and
+    /// take `best` as the selected row. Candidates match by source peer
+    /// and path-id, as in [`Self::update`].
+    pub fn mirror(
+        &mut self,
+        prefix: P,
+        added: Option<&BgpRib>,
+        replaced: &[BgpRib],
+        best: Option<&BgpRib>,
+    ) {
+        if !replaced.is_empty() || added.is_some() {
+            let cands = self.0.entry(prefix).or_default();
+            let idents: BTreeSet<usize> = replaced.iter().chain(added).map(|r| r.ident).collect();
+            let had: Vec<bool> = idents
+                .iter()
+                .map(|&ident| has_candidate(cands, ident))
+                .collect();
+            if !replaced.is_empty() {
+                cands.retain(|r| {
+                    !replaced
+                        .iter()
+                        .any(|rr| rr.ident == r.ident && rr.remote_id == r.remote_id)
+                });
+            }
+            if let Some(a) = added {
+                cands.retain(|r| !(r.ident == a.ident && r.remote_id == a.remote_id));
+                cands.push_exact(a.clone());
+            }
+            cands.shrink_to_fit();
+            for (&ident, had) in idents.iter().zip(had) {
+                self.3.track(ident, had, has_candidate(cands, ident));
+            }
+            if cands.is_empty() {
+                self.0.remove(&prefix);
+            }
+        }
+        match best {
+            Some(b) => {
+                self.1.insert(prefix, b.clone());
+            }
+            None => {
+                self.1.remove(&prefix);
+            }
+        }
     }
 
     // Return selected best path, not the change history.
@@ -35453,6 +35539,7 @@ mod multipath_tests {
                 max_paths_ibgp: None,
                 relax,
             },
+            Default::default(),
         )
     }
 

@@ -304,6 +304,13 @@ pub enum BgpVrfMsg {
     /// re-runs its policies, and no session is reset.
     EbgpRequiresPolicy(crate::bgp::policy::EbgpRequiresPolicy),
 
+    /// `clear bgp vrf <name> <peer-or-all> [soft [in|out]]` for the CE
+    /// peers of this VRF. `target` is a peer address or `all`.
+    Clear {
+        target: String,
+        op: crate::bgp::peer::BgpClearOp,
+    },
+
     /// Refresh the config-derived MUP segment catalog (which VRFs are
     /// interwork / direct segments, with their kernel tables). The global
     /// task seeds it right after spawn and re-broadcasts diff-gated

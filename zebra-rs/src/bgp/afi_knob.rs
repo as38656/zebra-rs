@@ -214,6 +214,71 @@ pub(super) fn set_send_community_large(
     set_send_community(cfg, afi_safi, CommunityKind::Large, op, args)
 }
 
+/// `afi-safi <name> maximum-prefix max <N>`. Without it the other
+/// `maximum-prefix` leaves do nothing.
+pub(super) fn set_maximum_prefix_max(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let max = if op.is_set() { Some(args.u32()?) } else { None };
+    cfg.sub.entry(afi_safi).or_default().prefix_limit.max = max;
+    Some(())
+}
+
+/// `afi-safi <name> maximum-prefix threshold <percent>`.
+pub(super) fn set_maximum_prefix_threshold(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let threshold = if op.is_set() { Some(args.u8()?) } else { None };
+    cfg.sub.entry(afi_safi).or_default().prefix_limit.threshold = threshold;
+    Some(())
+}
+
+/// `afi-safi <name> maximum-prefix warning-only <bool>`.
+pub(super) fn set_maximum_prefix_warning_only(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let value = op.is_set() && args.boolean()?;
+    cfg.sub
+        .entry(afi_safi)
+        .or_default()
+        .prefix_limit
+        .warning_only = value;
+    Some(())
+}
+
+/// `afi-safi <name> maximum-prefix restart <minutes>`.
+pub(super) fn set_maximum_prefix_restart(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let minutes = if op.is_set() { Some(args.u16()?) } else { None };
+    cfg.sub.entry(afi_safi).or_default().prefix_limit.restart = minutes;
+    Some(())
+}
+
+/// `afi-safi <name> maximum-prefix force <bool>`.
+pub(super) fn set_maximum_prefix_force(
+    cfg: &mut PeerConfig,
+    afi_safi: AfiSafi,
+    op: ConfigOp,
+    args: &mut Args,
+) -> Option<()> {
+    let value = op.is_set() && args.boolean()?;
+    cfg.sub.entry(afi_safi).or_default().prefix_limit.force = value;
+    Some(())
+}
+
 /// `afi-safi <name> next-hop-self <bool>` — records the verbatim
 /// statement only.
 ///

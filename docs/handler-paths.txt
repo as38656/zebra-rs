@@ -155,6 +155,11 @@
 /router/bgp/neighbor/afi-safi/graceful-restart/enabled
 /router/bgp/neighbor/afi-safi/long-lived-graceful-restart/enabled
 /router/bgp/neighbor/afi-safi/long-lived-graceful-restart/restart-time
+/router/bgp/neighbor/afi-safi/maximum-prefix/force
+/router/bgp/neighbor/afi-safi/maximum-prefix/max
+/router/bgp/neighbor/afi-safi/maximum-prefix/restart
+/router/bgp/neighbor/afi-safi/maximum-prefix/threshold
+/router/bgp/neighbor/afi-safi/maximum-prefix/warning-only
 /router/bgp/neighbor/afi-safi/next-hop-self
 /router/bgp/neighbor/afi-safi/next-hop-unchanged
 /router/bgp/neighbor/afi-safi/policy/in
@@ -276,6 +281,11 @@
 /router/bgp/vrf/neighbor/afi-safi/graceful-restart/enabled
 /router/bgp/vrf/neighbor/afi-safi/long-lived-graceful-restart/enabled
 /router/bgp/vrf/neighbor/afi-safi/long-lived-graceful-restart/restart-time
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/force
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/max
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/restart
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/threshold
+/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/warning-only
 /router/bgp/vrf/neighbor/afi-safi/next-hop-self
 /router/bgp/vrf/neighbor/afi-safi/next-hop-unchanged
 /router/bgp/vrf/neighbor/afi-safi/policy/in

@@ -4286,6 +4286,67 @@ fn queue_egress_resync(bgp: &mut Bgp, addr: IpAddr) {
     }
 }
 
+/// `set/delete router bgp neighbor <addr> afi-safi <name> maximum-prefix
+/// <leaf> …`, with `setter` for the leaf. A changed limit is taken into
+/// the session at `CommitEnd`, once every leaf of the commit is in.
+fn config_maximum_prefix(
+    bgp: &mut Bgp,
+    mut args: Args,
+    op: ConfigOp,
+    setter: AfiKnobSetter,
+) -> Option<()> {
+    let addr = args.addr()?;
+    let afi_safi: AfiSafi = args.afi_safi()?;
+    let peer = bgp.peers.get_mut(&addr)?;
+    let before = peer.prefix_limit_of(afi_safi);
+    setter(&mut peer.config, afi_safi, op, &mut args)?;
+    if peer.prefix_limit_of(afi_safi) != before {
+        bgp.prefix_limit_changes.insert((peer.ident, afi_safi));
+    }
+    Some(())
+}
+
+fn config_maximum_prefix_max(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_maximum_prefix(bgp, args, op, super::afi_knob::set_maximum_prefix_max)
+}
+
+fn config_maximum_prefix_threshold(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_maximum_prefix(bgp, args, op, super::afi_knob::set_maximum_prefix_threshold)
+}
+
+fn config_maximum_prefix_warning_only(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_maximum_prefix(
+        bgp,
+        args,
+        op,
+        super::afi_knob::set_maximum_prefix_warning_only,
+    )
+}
+
+fn config_maximum_prefix_restart(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_maximum_prefix(bgp, args, op, super::afi_knob::set_maximum_prefix_restart)
+}
+
+fn config_maximum_prefix_force(bgp: &mut Bgp, args: Args, op: ConfigOp) -> Option<()> {
+    config_maximum_prefix(bgp, args, op, super::afi_knob::set_maximum_prefix_force)
+}
+
+/// Take this commit's `maximum-prefix` changes into the live sessions,
+/// and check the counts against the new limits at once: a lowered limit
+/// closes a session that is now over it.
+pub(super) fn finish_commit_prefix_limits(bgp: &mut Bgp) {
+    let mut changed = std::collections::BTreeMap::<usize, Vec<AfiSafi>>::new();
+    for (ident, afi_safi) in std::mem::take(&mut bgp.prefix_limit_changes) {
+        if let Some(peer) = bgp.peers.get_mut_by_idx(ident) {
+            peer.prefix_limit_changed(afi_safi);
+            changed.entry(ident).or_default().push(afi_safi);
+        }
+    }
+    for (ident, families) in changed {
+        bgp.check_prefix_limits(ident, &families);
+    }
+}
+
 fn config_llgr(bgp: &mut Bgp, mut args: Args, op: ConfigOp) -> Option<()> {
     let addr = args.addr()?;
     let afi_safi: AfiSafi = args.afi_safi()?;
@@ -5869,6 +5930,26 @@ impl Bgp {
             super::vrf_config::config_vrf_neighbor_afi_safi_send_community_large,
         );
         self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/max",
+            super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_max,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/threshold",
+            super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_threshold,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/warning-only",
+            super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_warning_only,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/restart",
+            super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_restart,
+        );
+        self.callback_add(
+            "/router/bgp/vrf/neighbor/afi-safi/maximum-prefix/force",
+            super::vrf_config::config_vrf_neighbor_afi_safi_maximum_prefix_force,
+        );
+        self.callback_add(
             "/router/bgp/vrf/neighbor/afi-safi/policy/in",
             super::vrf_config::config_vrf_neighbor_afi_safi_policy_in,
         );
@@ -6108,6 +6189,23 @@ impl Bgp {
         self.callback_peer("/afi-safi/next-hop-unchanged", config_next_hop_unchanged);
         self.callback_peer("/afi-safi/prefix-sid/send", config_prefix_sid_send);
         self.callback_peer("/afi-safi/prefix-sid/accept", config_prefix_sid_accept);
+        self.callback_peer("/afi-safi/maximum-prefix/max", config_maximum_prefix_max);
+        self.callback_peer(
+            "/afi-safi/maximum-prefix/threshold",
+            config_maximum_prefix_threshold,
+        );
+        self.callback_peer(
+            "/afi-safi/maximum-prefix/warning-only",
+            config_maximum_prefix_warning_only,
+        );
+        self.callback_peer(
+            "/afi-safi/maximum-prefix/restart",
+            config_maximum_prefix_restart,
+        );
+        self.callback_peer(
+            "/afi-safi/maximum-prefix/force",
+            config_maximum_prefix_force,
+        );
         self.callback_peer(
             "/afi-safi/send-community/standard",
             config_send_community_standard,

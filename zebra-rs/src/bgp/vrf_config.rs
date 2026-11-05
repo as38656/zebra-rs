@@ -1526,6 +1526,26 @@ vrf_afi_knob! {
     config_vrf_neighbor_afi_safi_send_community_extended => set_send_community_extended
 }
 vrf_afi_knob! {
+    /// `… afi-safi <af> maximum-prefix max <N>`.
+    config_vrf_neighbor_afi_safi_maximum_prefix_max => set_maximum_prefix_max
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> maximum-prefix threshold <percent>`.
+    config_vrf_neighbor_afi_safi_maximum_prefix_threshold => set_maximum_prefix_threshold
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> maximum-prefix warning-only <bool>`.
+    config_vrf_neighbor_afi_safi_maximum_prefix_warning_only => set_maximum_prefix_warning_only
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> maximum-prefix restart <minutes>`.
+    config_vrf_neighbor_afi_safi_maximum_prefix_restart => set_maximum_prefix_restart
+}
+vrf_afi_knob! {
+    /// `… afi-safi <af> maximum-prefix force <bool>`.
+    config_vrf_neighbor_afi_safi_maximum_prefix_force => set_maximum_prefix_force
+}
+vrf_afi_knob! {
     /// `… afi-safi <af> send-community large <bool>`.
     config_vrf_neighbor_afi_safi_send_community_large => set_send_community_large
 }

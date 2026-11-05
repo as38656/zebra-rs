@@ -20,8 +20,6 @@ use std::sync::Arc;
 use bgp_packet::{Ipv4Nlri, Ipv6Nlri, RouteDistinguisher};
 use ipnet::Ipv4Net;
 
-use crate::exact_rows::ExactRows;
-
 use super::super::route::BgpRib;
 use super::BgpShard;
 use super::msg::{
@@ -274,32 +272,7 @@ impl BgpShard {
         replaced: &[BgpRib],
         best: Option<&BgpRib>,
     ) {
-        if !replaced.is_empty() || added.is_some() {
-            let cands = self.v4.0.entry(prefix).or_default();
-            if !replaced.is_empty() {
-                cands.retain(|r| {
-                    !replaced
-                        .iter()
-                        .any(|rr| rr.ident == r.ident && rr.remote_id == r.remote_id)
-                });
-            }
-            if let Some(a) = added {
-                cands.retain(|r| !(r.ident == a.ident && r.remote_id == a.remote_id));
-                cands.push_exact(a.clone());
-            }
-            cands.shrink_to_fit();
-            if cands.is_empty() {
-                self.v4.0.remove(&prefix);
-            }
-        }
-        match best {
-            Some(b) => {
-                self.v4.1.insert(prefix, b.clone());
-            }
-            None => {
-                self.v4.1.remove(&prefix);
-            }
-        }
+        self.v4.mirror(prefix, added, replaced, best);
     }
 
     /// Replace mirrored candidates in place with `rows` (matched by source
@@ -1085,8 +1058,9 @@ mod tests {
     use super::super::super::route::{BgpRibType, PolicyDecision};
     use super::super::ShardLabelPool;
     use super::*;
+    use crate::bgp::prefix_limit::PrefixCounts;
     use crate::rib::label_space::SharedLabelSpace;
-    use bgp_packet::{BgpAttr, BgpNexthop};
+    use bgp_packet::{Afi, AfiSafi, BgpAttr, BgpNexthop, Safi};
 
     fn v4(s: &str) -> Ipv4Nlri {
         Ipv4Nlri {
@@ -1507,6 +1481,123 @@ mod tests {
             }
             _ => panic!("expected one BestPathV4, got {out:?}"),
         }
+    }
+
+    fn counts(received: u64, accepted: u64) -> PrefixCounts {
+        PrefixCounts { received, accepted }
+    }
+
+    /// `maximum-prefix` counts. A received prefix is in the peer's
+    /// Adj-RIB-In whatever the inbound policy said; an accepted one also
+    /// has a Loc-RIB row from the peer. A re-sent prefix replaces, so it
+    /// changes no count.
+    #[test]
+    fn prefix_counts_follow_accept_and_deny() {
+        let v4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut shard = BgpShard::default();
+        shard.handle(update_v4(1, "10.0.0.0/24", "192.0.2.1", true));
+        shard.handle(update_v4(1, "10.0.1.0/24", "192.0.2.1", false));
+        shard.handle(update_v4(2, "10.0.0.0/24", "192.0.2.2", true));
+        assert_eq!(shard.prefix_counts(1, v4u), counts(2, 1));
+        assert_eq!(shard.prefix_counts(2, v4u), counts(1, 1));
+
+        shard.handle(update_v4(1, "10.0.0.0/24", "192.0.2.9", true));
+        assert_eq!(shard.prefix_counts(1, v4u), counts(2, 1), "replaced");
+        shard.handle(update_v4(1, "10.0.1.0/24", "192.0.2.9", true));
+        assert_eq!(shard.prefix_counts(1, v4u), counts(2, 2), "now accepted");
+        shard.handle(update_v4(1, "10.0.0.0/24", "192.0.2.9", false));
+        assert_eq!(shard.prefix_counts(1, v4u), counts(2, 1), "now denied");
+
+        shard.handle(ShardMsg::WithdrawV4 {
+            ident: 1,
+            rd: None,
+            nlri: v4("10.0.1.0/24"),
+            rib_in: true,
+        });
+        assert_eq!(shard.prefix_counts(1, v4u), counts(1, 0));
+        shard.handle(ShardMsg::PeerDown { ident: 1 });
+        assert_eq!(shard.prefix_counts(1, v4u), counts(0, 0));
+        assert_eq!(shard.prefix_counts(2, v4u), counts(1, 1));
+    }
+
+    /// Two paths of one prefix (Add-Path) are one prefix.
+    #[test]
+    fn prefix_counts_count_prefixes_not_paths() {
+        let v4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let mut shard = BgpShard::default();
+        for id in [1, 2] {
+            let ShardMsg::UpdateV4(mut u) = update_v4(1, "10.0.0.0/24", "192.0.2.1", true) else {
+                unreachable!()
+            };
+            u.nlri.id = id;
+            shard.handle(ShardMsg::UpdateV4(u));
+        }
+        assert_eq!(shard.prefix_counts(1, v4u), counts(1, 1));
+        let mut nlri = v4("10.0.0.0/24");
+        nlri.id = 1;
+        shard.handle(ShardMsg::WithdrawV4 {
+            ident: 1,
+            rd: None,
+            nlri,
+            rib_in: true,
+        });
+        assert_eq!(shard.prefix_counts(1, v4u), counts(1, 1), "path 2 is left");
+    }
+
+    /// Every counted family keeps its own counts.
+    #[test]
+    fn prefix_counts_cover_v6_vpn_and_labeled_unicast() {
+        let rd = RouteDistinguisher::default();
+        let mut shard = BgpShard::default();
+        shard.handle(update_v6(4, "2001:db8:1::/64"));
+        shard.handle(update_lu_v4(4, "10.9.0.0/24", 100));
+        shard.handle(vpnv6_update(4, rd, "2001:db8:2::/64"));
+        shard.handle(vpnv6_update(4, rd, "2001:db8:3::/64"));
+        let family = |afi, safi| shard.prefix_counts(4, AfiSafi::new(afi, safi));
+        assert_eq!(family(Afi::Ip6, Safi::Unicast), counts(1, 1));
+        assert_eq!(family(Afi::Ip, Safi::MplsLabel), counts(1, 1));
+        assert_eq!(family(Afi::Ip6, Safi::MplsVpn), counts(2, 2));
+        assert_eq!(family(Afi::Ip, Safi::Unicast), counts(0, 0));
+        assert_eq!(family(Afi::Ip, Safi::MplsVpn), counts(0, 0));
+        assert_eq!(family(Afi::L2vpn, Safi::Evpn), counts(0, 0));
+    }
+
+    /// Main's read replica of a pool shard's IPv4 table (`mirror_v4`)
+    /// keeps the same accepted count as the table it copies.
+    #[test]
+    fn the_v4_replica_keeps_the_accepted_count() {
+        let v4u = AfiSafi::new(Afi::Ip, Safi::Unicast);
+        let prefix: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let mut owner = BgpShard::default();
+        let mut replica = BgpShard::default();
+        for msg in [
+            update_v4(1, "10.0.0.0/24", "192.0.2.1", true),
+            update_v4(1, "10.0.0.0/24", "192.0.2.2", true),
+            update_v4(2, "10.0.0.0/24", "192.0.2.3", true),
+            update_v4(1, "10.0.0.0/24", "192.0.2.2", false),
+        ] {
+            for out in owner.handle(msg) {
+                let ShardOut::BestPathV4 {
+                    selected,
+                    replaced,
+                    added,
+                    ..
+                } = out
+                else {
+                    panic!("expected BestPathV4")
+                };
+                replica.mirror_v4(prefix, added.as_ref(), &replaced, selected.first());
+            }
+            for ident in [1, 2] {
+                assert_eq!(
+                    replica.prefix_counts(ident, v4u).accepted,
+                    owner.prefix_counts(ident, v4u).accepted,
+                    "peer {ident}"
+                );
+            }
+        }
+        assert_eq!(replica.prefix_counts(1, v4u).accepted, 0);
+        assert_eq!(replica.prefix_counts(2, v4u).accepted, 1);
     }
 
     #[test]
