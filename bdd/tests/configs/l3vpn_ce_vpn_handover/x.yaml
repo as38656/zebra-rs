@@ -1,0 +1,34 @@
+# x — CE of a (AS 65200). It announces nothing at the start; the feature
+# adds 192.0.2.64/26 and 2001:db8:e1::/48 later, so b gets them from the
+# VPN after it has them from ce.
+interface:
+- if-name: t-a
+  ipv4:
+    address: 10.2.0.2/30
+  ipv6:
+    address: 2001:db8:2e::2/64
+router:
+  bgp:
+    global:
+      as: 65200
+      router-id: 10.2.0.2
+    timer:
+      adv-interval:
+        ebgp: 1
+    neighbor:
+    - remote-address: 10.2.0.1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    - remote-address: 2001:db8:2e::1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv6
+        enabled: true

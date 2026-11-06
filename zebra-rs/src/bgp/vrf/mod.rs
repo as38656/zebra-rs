@@ -11,11 +11,13 @@
 //! import from the global VPNv4 Loc-RIB across the
 //! `BgpGlobalMsg` / `BgpVrfMsg` channels.
 
+pub mod imports;
 pub mod inst;
 pub mod msg;
 pub mod sid;
 pub mod spawn;
 
+pub use imports::VrfImports;
 pub use sid::{BgpSidPool, Srv6VrfSid};
 
 // External consumers (`Bgp` field types, `process_vrf_global_msg`)

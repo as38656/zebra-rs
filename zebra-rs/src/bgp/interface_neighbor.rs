@@ -361,8 +361,7 @@ fn teardown_peer(bgp: &mut Bgp, ifindex: u32) {
             flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: bgp.as_sets_withdraw,
         };
         super::route::route_clean(peer_idx, &mut bgp_ref, &mut bgp.peers, bgp.shards.as_ref());

@@ -1,0 +1,90 @@
+# a — PE with the CE x in VRF cust. It exports what x announces as
+# VPNv4/VPNv6 over SRv6 with RT 65000:100 and its End.DT46 service SID.
+vrf:
+- name: cust
+  ipv4:
+    route-target:
+      import:
+      - 65000:100
+      export:
+      - 65000:100
+  ipv6:
+    route-target:
+      import:
+      - 65000:100
+      export:
+      - 65000:100
+interface:
+- if-name: lo
+  ipv6:
+    address: 2001:db8::1/128
+- if-name: t-x
+  vrf: cust
+  ipv4:
+    address: 10.2.0.1/30
+  ipv6:
+    address: 2001:db8:2e::1/64
+segment-routing:
+  locator:
+  - name: LOC1
+    prefix: fcbb:bbbb:1::/48
+    behavior: usid
+router:
+  isis:
+    net: 49.0000.0000.0000.0001.00
+    hostname: a
+    is-type: level-2-only
+    segment-routing:
+      srv6:
+        locator: LOC1
+    interface:
+    - if-name: lo
+      ipv6:
+        enabled: true
+    - if-name: t-b
+      network-type: point-to-point
+      metric: 10
+      ipv6:
+        enabled: true
+  bgp:
+    global:
+      as: 65000
+      router-id: 10.0.0.1
+    timer:
+      adv-interval:
+        ebgp: 1
+        ibgp: 1
+    segment-routing:
+      srv6:
+        locator: LOC1
+    neighbor:
+    - remote-address: 2001:db8::2
+      remote-as: 65000
+      update-source: 2001:db8::1
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: vpnv4
+        enabled: true
+      - name: vpnv6
+        enabled: true
+    vrf:
+    - name: cust
+      rd: 65000:1
+      encapsulation: srv6
+      neighbor:
+      - remote-address: 10.2.0.2
+        remote-as: 65200
+        timers:
+          connect-retry-time: 3
+        afi-safi:
+        - name: ipv4
+          enabled: true
+      - remote-address: 2001:db8:2e::2
+        remote-as: 65200
+        timers:
+          connect-retry-time: 3
+        afi-safi:
+        - name: ipv6
+          enabled: true

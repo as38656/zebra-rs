@@ -992,17 +992,6 @@ fn table_map_apply<'a>(
     Some(Cow::Owned(mapped))
 }
 
-/// Reconcile the kernel FIB state for `prefix` with the BGP best-path
-/// outcome. `selected` is the `select_best_path` return: at most one
-/// `BgpRib` after best-path selection. Empty means every candidate
-/// just disappeared — emit a withdraw.
-///
-/// In a per-VRF task this is the single install path for `rd == None`
-/// winners: imported VPN routes (carried in `bgp.vrf_transport_v4`)
-/// install their labelled tunnel entry, CE-learned routes install the
-/// plain next-hop entry, so whichever wins best-path is programmed
-/// correctly. On the global instance `vrf_transport_v4` is `None`, so
-/// this is plain IPv4 unicast install (VPNv4 / EVPN take other paths).
 /// Extend a single-next-hop FIB entry into an ECMP set from the rest of
 /// the multipath selection.
 ///
@@ -1077,30 +1066,99 @@ fn widen_to_multipath(entry: &mut rib::entry::RibEntry, rest: &[BgpRib], v6: boo
     }
 }
 
-pub(super) fn fib_install_v4(bgp: &super::peer::BgpTop, prefix: Ipv4Net, selected: &[BgpRib]) {
-    let transport = bgp
-        .vrf_transport_v4
-        .and_then(|m| m.get(&prefix))
-        .map(|v| v.as_slice());
+/// What a selection installs: the winner after `table-map`, the VPN
+/// transport of the winner when the VRF imported it, and the FIB entry
+/// built from both. Built only by [`fib_choice_v4`] / [`fib_choice_v6`],
+/// which [`fib_install_v4`] and [`fib_installable_v4`] (and the v6
+/// twins) share, so the suppress-fib-pending gate never arms a hold for
+/// a selection the installer would not program.
+struct FibChoice<'s, 'a> {
+    best: Option<std::borrow::Cow<'s, BgpRib>>,
+    transport: Option<&'a [rib::nht::ResolvedNexthop]>,
+    entry: Option<rib::entry::RibEntry>,
+}
+
+/// The winner's NHT resolution (global instance only): carries the SRv6
+/// segment list to inherit when the next-hop is covered by an
+/// SRv6-encapsulated route.
+fn winner_nht_transport<'a>(
+    bgp: &'a super::peer::BgpTop,
+    best: Option<&BgpRib>,
+) -> Option<&'a [rib::nht::ResolvedNexthop]> {
+    let cache = bgp.nexthop_cache.as_deref()?;
+    let nh = super::nht::bgp_nexthop_ip(&best?.attr)?;
+    Some(cache.transport_for(0, nh))
+}
+
+fn fib_choice_v4<'s, 'a>(
+    bgp: &'a super::peer::BgpTop,
+    prefix: Ipv4Net,
+    selected: &'s [BgpRib],
+) -> FibChoice<'s, 'a> {
     let best = table_map_apply(
         &bgp.local_rib.table_map,
         *bgp.router_id,
         IpNet::V4(prefix),
         selected.first(),
     );
+    let transport = best
+        .as_deref()
+        .and_then(|b| bgp.vrf_imports?.transport_v4(prefix, b));
+    let nht_transport = winner_nht_transport(bgp, best.as_deref());
+    let entry = best
+        .as_deref()
+        .and_then(|b| select_fib_entry_v4(b, transport, nht_transport));
+    FibChoice {
+        best,
+        transport,
+        entry,
+    }
+}
+
+fn fib_choice_v6<'s, 'a>(
+    bgp: &'a super::peer::BgpTop,
+    prefix: Ipv6Net,
+    selected: &'s [BgpRib],
+) -> FibChoice<'s, 'a> {
+    let best = table_map_apply(
+        &bgp.local_rib.table_map,
+        *bgp.router_id,
+        IpNet::V6(prefix),
+        selected.first(),
+    );
+    let transport = best
+        .as_deref()
+        .and_then(|b| bgp.vrf_imports?.transport_v6(prefix, b));
+    let nht_transport = winner_nht_transport(bgp, best.as_deref());
+    let entry = best
+        .as_deref()
+        .and_then(|b| select_fib_entry_v6(b, transport, nht_transport));
+    FibChoice {
+        best,
+        transport,
+        entry,
+    }
+}
+
+/// Reconcile the kernel FIB state for `prefix` with the BGP best-path
+/// outcome. `selected` is the `select_best_path` return: the winner
+/// first, then any multipath members. Empty means every candidate just
+/// disappeared — emit a withdraw.
+///
+/// In a per-VRF task this is the single install path for `rd == None`
+/// winners: an imported VPN route installs its labelled or SRv6 tunnel
+/// entry with the transport of its import (from `bgp.vrf_imports`),
+/// CE-learned routes install the plain next-hop entry, so whichever wins
+/// best-path is programmed correctly. On the global instance
+/// `vrf_imports` is `None`, so this is plain IPv4 unicast install
+/// (VPNv4 / EVPN take other paths).
+pub(super) fn fib_install_v4(bgp: &super::peer::BgpTop, prefix: Ipv4Net, selected: &[BgpRib]) {
+    let FibChoice {
+        best,
+        transport,
+        entry,
+    } = fib_choice_v4(bgp, prefix, selected);
     let best = best.as_deref();
-    // The winner's NHT resolution (global instance only): carries the
-    // SRv6 segment list to inherit when the next-hop is covered by an
-    // SRv6-encapsulated route.
-    let nht_transport = bgp.nexthop_cache.as_deref().and_then(|cache| {
-        best.and_then(|b| super::nht::bgp_nexthop_ip(&b.attr))
-            .map(|nh| cache.transport_for(0, nh))
-    });
-    let entry = best.and_then(|b| select_fib_entry_v4(b, transport, nht_transport));
-    // Pins the suppress-fib-pending gate's `fib_installable_v4` to this
-    // derivation: the two must agree, or the gate arms holds no
-    // forwarding-plane ack can ever release.
-    debug_assert_eq!(entry.is_some(), fib_installable_v4(bgp, prefix, selected));
     match entry {
         Some(mut rib_entry) => {
             // Colour-aware steering — plain-path only; a VPN tunnel
@@ -1326,83 +1384,36 @@ fn select_fib_entry_v6(
 /// that installs nothing — a locally-originated `network` prefix with no
 /// usable next-hop, or a table-map deny, sends no FIB add, so no
 /// forwarding-plane ack will ever release the hold and every such prefix
-/// would stall the full [`FIB_PENDING_TIMEOUT`]. Mirrors the installer's
-/// entry derivation through the same primitives; `fib_install_v4`
-/// carries a `debug_assert` pinning the two together.
+/// would stall the full [`FIB_PENDING_TIMEOUT`]. Uses the installer's
+/// own derivation ([`fib_choice_v4`]), so the two cannot disagree.
 pub(super) fn fib_installable_v4(
     bgp: &super::peer::BgpTop,
     prefix: Ipv4Net,
     selected: &[BgpRib],
 ) -> bool {
-    let transport = bgp
-        .vrf_transport_v4
-        .and_then(|m| m.get(&prefix))
-        .map(|v| v.as_slice());
-    let best = table_map_apply(
-        &bgp.local_rib.table_map,
-        *bgp.router_id,
-        IpNet::V4(prefix),
-        selected.first(),
-    );
-    let best = best.as_deref();
-    let nht_transport = bgp.nexthop_cache.as_deref().and_then(|cache| {
-        best.and_then(|b| super::nht::bgp_nexthop_ip(&b.attr))
-            .map(|nh| cache.transport_for(0, nh))
-    });
-    best.and_then(|b| select_fib_entry_v4(b, transport, nht_transport))
-        .is_some()
+    fib_choice_v4(bgp, prefix, selected).entry.is_some()
 }
 
-/// v6 twin of [`fib_installable_v4`], pinned by the `debug_assert` in
+/// v6 twin of [`fib_installable_v4`], sharing [`fib_choice_v6`] with
 /// [`fib_install_v6`].
 pub(super) fn fib_installable_v6(
     bgp: &super::peer::BgpTop,
     prefix: Ipv6Net,
     selected: &[BgpRib],
 ) -> bool {
-    let transport = bgp
-        .vrf_transport_v6
-        .and_then(|m| m.get(&prefix))
-        .map(|v| v.as_slice());
-    let best = table_map_apply(
-        &bgp.local_rib.table_map,
-        *bgp.router_id,
-        IpNet::V6(prefix),
-        selected.first(),
-    );
-    let best = best.as_deref();
-    let nht_transport = bgp.nexthop_cache.as_deref().and_then(|cache| {
-        best.and_then(|b| super::nht::bgp_nexthop_ip(&b.attr))
-            .map(|nh| cache.transport_for(0, nh))
-    });
-    best.and_then(|b| select_fib_entry_v6(b, transport, nht_transport))
-        .is_some()
+    fib_choice_v6(bgp, prefix, selected).entry.is_some()
 }
 
 /// IPv6 counterpart of [`fib_install_v4`]: the single install path for
 /// `rd == None` v6 winners in a VRF (imported VPNv6 labelled entry vs
 /// CE plain entry), and plain v6 unicast install on the global instance.
 pub(super) fn fib_install_v6(bgp: &super::peer::BgpTop, prefix: Ipv6Net, selected: &[BgpRib]) {
-    let transport = bgp
-        .vrf_transport_v6
-        .and_then(|m| m.get(&prefix))
-        .map(|v| v.as_slice());
-    let best = table_map_apply(
-        &bgp.local_rib.table_map,
-        *bgp.router_id,
-        IpNet::V6(prefix),
-        selected.first(),
-    );
+    let FibChoice {
+        best,
+        transport,
+        entry,
+    } = fib_choice_v6(bgp, prefix, selected);
     let best = best.as_deref();
-    // The winner's NHT resolution (global instance only) — see
-    // `fib_install_v4`.
-    let nht_transport = bgp.nexthop_cache.as_deref().and_then(|cache| {
-        best.and_then(|b| super::nht::bgp_nexthop_ip(&b.attr))
-            .map(|nh| cache.transport_for(0, nh))
-    });
-    let entry = best.and_then(|b| select_fib_entry_v6(b, transport, nht_transport));
-    // Same pinning as `fib_install_v4` — see the assert there.
-    debug_assert_eq!(entry.is_some(), fib_installable_v6(bgp, prefix, selected));
     match entry {
         Some(mut rib_entry) => {
             // Colour-aware SRv6 steering — plain-path only. A VPN tunnel
@@ -7383,8 +7394,7 @@ mod evpn_nexthop_wiring_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         }
     }
@@ -19518,8 +19528,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         route_advertise_mup_to_peers(rd, prefix, &selected, &mut bgp_ref, &mut self.peers);
@@ -19689,8 +19698,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19747,8 +19755,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19814,8 +19821,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19847,8 +19853,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19899,8 +19904,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19937,8 +19941,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -19994,8 +19997,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20030,8 +20032,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20119,8 +20120,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20163,8 +20163,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20239,8 +20238,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20280,8 +20278,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20339,8 +20336,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20378,8 +20374,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20439,8 +20434,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20476,8 +20470,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20726,8 +20719,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -20779,8 +20771,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         for (rd, prefix, rib) in remote {
@@ -21076,8 +21067,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -21248,8 +21238,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -21358,8 +21347,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -22355,8 +22343,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         for (rd, prefix, rib) in routes {
@@ -24386,8 +24373,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
 
@@ -24511,8 +24497,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         if !selected.is_empty() {
@@ -25165,8 +25150,7 @@ mod evpn_addpath_fanout_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         }
     }
@@ -25596,8 +25580,7 @@ mod vpnv6_transit_label_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         }
     }
@@ -29970,7 +29953,7 @@ mod tests {
         use crate::rib::nht::ResolvedNexthop;
         // Imported (`Originated`) row: its `attr.nexthop` was rewritten
         // to the VRF router-id (ignored here), the service label rides
-        // on `.label`, and the transport map supplies the real egress.
+        // on `.label`, and the import's transport supplies the real egress.
         let mut rib = bgp_rib_with_nexthop(
             Some(BgpNexthop::Ipv4(Ipv4Addr::new(10, 255, 0, 1))),
             super::BgpRibType::Originated,
@@ -30027,7 +30010,7 @@ mod tests {
 
     #[test]
     fn select_fib_entry_v4_originated_without_transport_is_plain() {
-        // `Originated` but absent from the transport map (a locally-
+        // `Originated` but with no import transport (a locally-
         // originated VRF route, not an import) → plain path, no self-loop.
         let rib = bgp_rib_with_nexthop(
             Some(BgpNexthop::Ipv4(Ipv4Addr::new(192, 0, 2, 9))),
@@ -30958,8 +30941,7 @@ mod enforce_first_as_local_as_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -31332,8 +31314,7 @@ mod inbound_drop_withdraw_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -31784,8 +31765,7 @@ mod fanout_winner_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -32243,8 +32223,7 @@ mod lu_sync_winner_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -33015,8 +32994,7 @@ mod v6_addpath_policy_out_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -33489,8 +33467,7 @@ mod addpath_exact_id_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -34859,8 +34836,7 @@ mod v6_empty_selection_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
 
@@ -34958,8 +34934,7 @@ mod v6_empty_selection_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
 
@@ -35085,8 +35060,7 @@ mod v6_empty_selection_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
 
@@ -35208,8 +35182,7 @@ mod v6_empty_selection_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
 
@@ -36204,8 +36177,7 @@ mod labeled_community_suppress_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         }
     }
@@ -36793,8 +36765,7 @@ mod eor_stale_expire_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
 
@@ -37038,8 +37009,7 @@ mod stale_sweep_per_family_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             }
         }
@@ -37398,8 +37368,7 @@ mod rfc4456_reflect_stamp_tests {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         }
     }
@@ -38236,8 +38205,7 @@ mod update_group_next_hop_knob_tests {
                 flex_algo_srv6_routes: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: false,
             };
         };

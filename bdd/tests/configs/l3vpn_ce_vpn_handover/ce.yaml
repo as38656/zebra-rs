@@ -1,0 +1,40 @@
+# ce — CE of b (AS 65100). It announces 192.0.2.64/26 and 2001:db8:e1::/48
+# from the start, so b learns them before the VPN brings the same prefixes.
+interface:
+- if-name: t-b
+  ipv4:
+    address: 10.1.0.2/30
+  ipv6:
+    address: 2001:db8:1e::2/64
+router:
+  bgp:
+    global:
+      as: 65100
+      router-id: 10.1.0.2
+    timer:
+      adv-interval:
+        ebgp: 1
+    neighbor:
+    - remote-address: 10.1.0.1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv4
+        enabled: true
+    - remote-address: 2001:db8:1e::1
+      remote-as: 65000
+      timers:
+        connect-retry-time: 3
+      enabled: true
+      afi-safi:
+      - name: ipv6
+        enabled: true
+    afi-safi:
+    - name: ipv4
+      network:
+      - prefix: 192.0.2.64/26
+    - name: ipv6
+      network:
+      - prefix: 2001:db8:e1::/48

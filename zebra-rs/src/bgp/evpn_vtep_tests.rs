@@ -215,8 +215,7 @@ async fn reflected_macip_keeps_label2() {
         flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
         vrf_import: None,
         nexthop_cache: None,
-        vrf_transport_v4: None,
-        vrf_transport_v6: None,
+        vrf_imports: None,
         as_sets_withdraw: bgp.as_sets_withdraw,
     };
     route_evpn_update(
@@ -260,8 +259,7 @@ fn receive_evpn(bgp: &mut Bgp, from: usize, route: &EvpnRoute, attr: &BgpAttr) {
         flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
         vrf_import: None,
         nexthop_cache: None,
-        vrf_transport_v4: None,
-        vrf_transport_v6: None,
+        vrf_imports: None,
         as_sets_withdraw: bgp.as_sets_withdraw,
     };
     route_evpn_update(
@@ -532,8 +530,7 @@ async fn stale_remote_route_does_not_override_a_local_mac() {
             flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: bgp.as_sets_withdraw,
         };
         route_evpn_update(
@@ -702,8 +699,7 @@ fn feed_macip(
         flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
         vrf_import: None,
         nexthop_cache: None,
-        vrf_transport_v4: None,
-        vrf_transport_v6: None,
+        vrf_imports: None,
         as_sets_withdraw: bgp.as_sets_withdraw,
     };
     if seq.is_none() {
@@ -1706,8 +1702,7 @@ async fn a_received_leaf_mac_reaches_the_rib_flagged() {
             flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: bgp.as_sets_withdraw,
         };
         route_evpn_update(
@@ -1900,8 +1895,7 @@ fn feed_evpn(bgp: &mut Bgp, from: usize, route: EvpnRoute, attr: Option<BgpAttr>
         flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
         vrf_import: None,
         nexthop_cache: None,
-        vrf_transport_v4: None,
-        vrf_transport_v6: None,
+        vrf_imports: None,
         as_sets_withdraw: bgp.as_sets_withdraw,
     };
     match attr {
@@ -2461,8 +2455,7 @@ fn export_selected(bgp: &mut Bgp, rd: &RouteDistinguisher, prefix: &EvpnPrefix, 
         flex_algo_srv6_routes: Some(&bgp.flex_algo_srv6_routes),
         vrf_import: None,
         nexthop_cache: None,
-        vrf_transport_v4: None,
-        vrf_transport_v6: None,
+        vrf_imports: None,
         as_sets_withdraw: bgp.as_sets_withdraw,
     };
     route_evpn_export_selected(rd, prefix, &[rib], None, &mut top);

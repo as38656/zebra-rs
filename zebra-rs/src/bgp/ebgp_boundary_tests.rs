@@ -205,8 +205,7 @@ macro_rules! with_top {
             flex_algo_srv6_routes: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: false,
         };
         $body

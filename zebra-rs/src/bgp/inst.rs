@@ -2635,8 +2635,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: Some(&import_dispatcher),
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         let Some(peer) = self.peers.get_mut_by_idx(ident) else {
@@ -2726,8 +2725,7 @@ impl Bgp {
                     flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
                     vrf_import: Some(&import_dispatcher),
                     nexthop_cache: Some(&mut self.nexthop_cache),
-                    vrf_transport_v4: None,
-                    vrf_transport_v6: None,
+                    vrf_imports: None,
                     as_sets_withdraw: self.as_sets_withdraw,
                 };
 
@@ -3495,8 +3493,7 @@ impl Bgp {
             vrf_export: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         super::route::route_advertise_to_peers(
@@ -3585,8 +3582,7 @@ impl Bgp {
             vrf_export: None,
             vrf_import: None,
             nexthop_cache: None,
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         super::route::route_advertise_to_peers_vpnv6(
@@ -4854,8 +4850,7 @@ impl Bgp {
                 vrf_export: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: self.as_sets_withdraw,
             };
             super::route::route_advertise_to_peers(
@@ -4975,8 +4970,7 @@ impl Bgp {
                 vrf_export: None,
                 vrf_import: None,
                 nexthop_cache: None,
-                vrf_transport_v4: None,
-                vrf_transport_v6: None,
+                vrf_imports: None,
                 as_sets_withdraw: self.as_sets_withdraw,
             };
             super::route::route_advertise_to_peers_vpnv6(
@@ -6669,8 +6663,7 @@ impl Bgp {
             vrf_export: None,
             vrf_import: None,
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         }
     }
@@ -6939,8 +6932,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: Some(&import_dispatcher),
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         super::route::bestpath_recompute_untracked(&mut top, &mut self.peers);
@@ -7028,8 +7020,7 @@ impl Bgp {
             // depends on the next-hop's resolved transport (SRv6
             // segment inheritance) — the install path needs the cache.
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         match &dep {
@@ -7733,8 +7724,7 @@ impl Bgp {
             // inherited encapsulation here — without the cache it
             // would degrade to a plain (unencapsulated) entry.
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         for (prefix, best) in &winners_v4 {
@@ -7794,8 +7784,7 @@ impl Bgp {
             vrf_export: None,
             vrf_import: None,
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         match (prefix, selected_v4, selected_v6) {
@@ -7895,8 +7884,7 @@ impl Bgp {
             vrf_export: None,
             vrf_import: None,
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         for (prefix, set) in &selected_v4 {
@@ -8181,8 +8169,7 @@ impl Bgp {
             flex_algo_srv6_routes: Some(&self.flex_algo_srv6_routes),
             vrf_import: Some(&import_dispatcher),
             nexthop_cache: Some(&mut self.nexthop_cache),
-            vrf_transport_v4: None,
-            vrf_transport_v6: None,
+            vrf_imports: None,
             as_sets_withdraw: self.as_sets_withdraw,
         };
         super::route::route_apply_bestpath_v4_batch(&mut bgp_ref, &mut self.peers, deltas);
@@ -8437,8 +8424,7 @@ impl Bgp {
                     vrf_export: None,
                     vrf_import: None,
                     nexthop_cache: None,
-                    vrf_transport_v4: None,
-                    vrf_transport_v6: None,
+                    vrf_imports: None,
                     as_sets_withdraw: self.as_sets_withdraw,
                 };
                 super::route::route_advertise_to_peers(
@@ -8636,8 +8622,7 @@ impl Bgp {
                     vrf_export: None,
                     vrf_import: None,
                     nexthop_cache: None,
-                    vrf_transport_v4: None,
-                    vrf_transport_v6: None,
+                    vrf_imports: None,
                     as_sets_withdraw: self.as_sets_withdraw,
                 };
                 super::route::route_advertise_to_peers_vpnv6(
